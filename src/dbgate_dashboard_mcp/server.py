@@ -128,6 +128,47 @@ async def list_databases(conid: str) -> dict:
     return {"databases": [], "single_database": False}
 
 
+_OBJECT_KINDS = (("tables", "table"), ("views", "view"), ("matviews", "matview"))
+
+
+async def _structure(conid: str, database: str) -> dict:
+    """Analysed database structure as DbGate reports it."""
+    return await dbgate.call(
+        "database-connections/structure", {"conid": conid, "database": database}
+    )
+
+
+@mcp.tool()
+async def list_tables(
+    conid: str, database: str | None = None, schema: str | None = None
+) -> dict:
+    """List tables, views and materialized views of a database.
+
+    Columns are deliberately omitted (only their count is reported) — use
+    describe_table for the details of one object.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        structure = await _structure(conid, db)
+    except Exception as exc:
+        return {"error": str(exc)}
+    objects = []
+    for key, kind in _OBJECT_KINDS:
+        for obj in structure.get(key) or []:
+            if schema and obj.get("schemaName") != schema:
+                continue
+            objects.append(
+                {
+                    "schema": obj.get("schemaName"),
+                    "name": obj.get("pureName"),
+                    "type": kind,
+                    "columns": len(obj.get("columns") or []),
+                    "size_bytes": obj.get("sizeBytes"),
+                }
+            )
+    return {"database": db, "objects": objects}
+
+
 def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 

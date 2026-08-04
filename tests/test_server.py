@@ -32,6 +32,85 @@ CONNECTIONS = [
 ]
 
 
+STRUCTURE = {
+    "engine": "postgres@dbgate-plugin-postgres",
+    "tables": [
+        {
+            "pureName": "artist",
+            "schemaName": "public",
+            "sizeBytes": 8192,
+            "objectId": 16390,
+            "contentHash": "abc",
+            "columns": [
+                {
+                    "columnName": "artist_id",
+                    "dataType": "integer",
+                    "notNull": True,
+                    "defaultValue": None,
+                    "autoIncrement": False,
+                    "postgresColumnId": 1,
+                },
+                {
+                    "columnName": "name",
+                    "dataType": "character varying(120)",
+                    "notNull": False,
+                    "defaultValue": None,
+                    "autoIncrement": False,
+                    "postgresColumnId": 2,
+                },
+            ],
+            "primaryKey": {
+                "constraintName": "artist_pkey",
+                "columns": [{"columnName": "artist_id"}],
+            },
+            "foreignKeys": [],
+            "indexes": [],
+            "uniques": [],
+        },
+        {
+            "pureName": "album",
+            "schemaName": "public",
+            "sizeBytes": 16384,
+            "columns": [{"columnName": "album_id", "dataType": "integer"}],
+            "primaryKey": None,
+            "foreignKeys": [
+                {
+                    "constraintName": "album_artist_id_fkey",
+                    "refSchemaName": "public",
+                    "refTableName": "artist",
+                    "updateAction": "NO ACTION",
+                    "deleteAction": "NO ACTION",
+                    "columns": [
+                        {"columnName": "artist_id", "refColumnName": "artist_id"}
+                    ],
+                }
+            ],
+            "indexes": [
+                {
+                    "constraintName": "album_artist_id_idx",
+                    "isUnique": False,
+                    "columns": [{"columnName": "artist_id", "isDescending": False}],
+                }
+            ],
+            "uniques": [],
+        },
+        {
+            "pureName": "album",
+            "schemaName": "reporting",
+            "columns": [],
+            "primaryKey": None,
+            "foreignKeys": [],
+            "indexes": [],
+            "uniques": [],
+        },
+    ],
+    "views": [
+        {"pureName": "top_sellers", "schemaName": "public", "columns": [{"columnName": "x"}]}
+    ],
+    "matviews": [],
+}
+
+
 def _fn(tool):
     # Works whether @mcp.tool() returns the raw function or a Tool wrapper.
     return getattr(tool, "fn", tool)
@@ -170,6 +249,61 @@ def test_list_databases_reports_unknown_conid(monkeypatch):
     out = asyncio.run(_fn(server.list_databases)(conid="nope"))
 
     assert "unknown conid 'nope'" in out["error"]
+
+
+def test_list_tables_flattens_tables_and_views(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.list_tables)(conid="con2"))
+
+    assert out["database"] == "chinook"
+    assert {"schema": "public", "name": "artist", "type": "table",
+            "columns": 2, "size_bytes": 8192} in out["objects"]
+    assert {"schema": "public", "name": "top_sellers", "type": "view",
+            "columns": 1, "size_bytes": None} in out["objects"]
+    assert len(out["objects"]) == 4
+
+
+def test_list_tables_filters_by_schema(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.list_tables)(conid="con2", schema="reporting"))
+
+    assert [o["name"] for o in out["objects"]] == ["album"]
+
+
+def test_list_tables_passes_explicit_database(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    asyncio.run(_fn(server.list_tables)(conid="con2", database="other"))
+
+    assert calls[0] == (
+        "database-connections/structure",
+        {"conid": "con2", "database": "other"},
+    )
+
+
+def test_list_tables_reports_error(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/structure": DbGateError("database not found"),
+        },
+    )
+
+    out = asyncio.run(_fn(server.list_tables)(conid="con2"))
+
+    assert out == {"error": "database not found"}
 
 
 def test_split_endpoint_parses_host_and_port():
