@@ -106,6 +106,28 @@ async def list_connections() -> dict:
     }
 
 
+@mcp.tool()
+async def list_databases(conid: str) -> dict:
+    """List databases available on a connection.
+
+    DbGate returns an empty list for connections pinned to one database
+    (``singleDatabase``); in that case the connection's default database is
+    reported with ``single_database: true``.
+    """
+    try:
+        conn = await _find_connection(conid)
+        rows = await dbgate.call("server-connections/list-databases", {"conid": conid})
+    except Exception as exc:
+        return {"error": str(exc)}
+    names = [r.get("name") for r in rows if r.get("name")]
+    if names:
+        return {"databases": names, "single_database": False}
+    default = conn.get("defaultDatabase")
+    if default:
+        return {"databases": [default], "single_database": True}
+    return {"databases": [], "single_database": False}
+
+
 def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 

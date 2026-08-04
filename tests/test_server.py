@@ -122,6 +122,56 @@ def test_connections_are_cached_between_lookups(monkeypatch):
     assert len(calls) == 1
 
 
+def test_list_databases_returns_server_list(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": [{"name": "chinook"}, {"name": "postgres"}],
+        },
+    )
+
+    out = asyncio.run(_fn(server.list_databases)(conid="con2"))
+
+    assert out == {"databases": ["chinook", "postgres"], "single_database": False}
+
+
+def test_list_databases_falls_back_to_default_when_empty(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": [],
+        },
+    )
+
+    out = asyncio.run(_fn(server.list_databases)(conid="con2"))
+
+    assert out == {"databases": ["chinook"], "single_database": True}
+
+
+def test_list_databases_empty_without_default(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": [],
+        },
+    )
+
+    out = asyncio.run(_fn(server.list_databases)(conid="con6"))
+
+    assert out == {"databases": [], "single_database": False}
+
+
+def test_list_databases_reports_unknown_conid(monkeypatch):
+    _stub(monkeypatch, {"connections/list": CONNECTIONS})
+
+    out = asyncio.run(_fn(server.list_databases)(conid="nope"))
+
+    assert "unknown conid 'nope'" in out["error"]
+
+
 def test_split_endpoint_parses_host_and_port():
     assert server._split_endpoint("http://dbgate.internal:3000") == (
         "dbgate.internal",
