@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from mcp.server.mcpserver import MCPServer
 
 from . import dbgate
+from .mongo_filter import to_condition, to_sort
 from .tunnel import SshLocalForwardTunnel
 
 
@@ -349,6 +350,50 @@ async def execute(conid: str, sql: str, database: str | None = None) -> dict:
         "columns": [c.get("columnName") for c in result.get("columns") or []],
         "rows": rows,
         "row_count": len(rows),
+    }
+
+
+@mcp.tool()
+async def find_documents(
+    conid: str,
+    collection: str,
+    filter: dict | None = None,
+    sort: dict | None = None,
+    skip: int = 0,
+    limit: int = DEFAULT_ROW_LIMIT,
+    database: str | None = None,
+) -> dict:
+    """Read documents from a MongoDB collection.
+
+    ``filter`` is a normal Mongo filter document; the supported subset is
+    equality, $eq/$ne/$gt/$gte/$lt/$lte, $in, $regex and $and/$or. $regex is
+    translated to a LIKE with the pattern wrapped in ``%``, so ``%`` and ``_``
+    inside it act as wildcards rather than literals.
+
+    ``sort`` takes the Mongo form ``{"field": 1}`` / ``{"field": -1}``.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        options: dict = {"pureName": collection, "limit": limit, "skip": skip}
+        condition = to_condition(filter)
+        if condition is not None:
+            options["condition"] = condition
+        sort_spec = to_sort(sort)
+        if sort_spec is not None:
+            options["sort"] = sort_spec
+        result = await dbgate.call(
+            "database-connections/collection-data",
+            {"conid": conid, "database": db, "options": options},
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    rows = result.get("rows") or []
+    return {
+        "database": db,
+        "collection": collection,
+        "documents": rows[:limit],
+        "count": len(rows[:limit]),
+        "truncated": len(rows) > limit,
     }
 
 

@@ -668,6 +668,114 @@ def test_execute_reports_error(monkeypatch):
     assert out == {"error": "syntax error at or near"}
 
 
+def test_find_documents_translates_filter_and_sort(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/collection-data": {"rows": [{"_id": 1, "name": "AC/DC"}]},
+        },
+    )
+
+    out = asyncio.run(
+        _fn(server.find_documents)(
+            conid="con2",
+            collection="artists",
+            filter={"name": "AC/DC"},
+            sort={"name": 1},
+            skip=5,
+            limit=10,
+        )
+    )
+
+    # calls[0] is the connections/list lookup that resolves the default database
+    assert calls[1] == (
+        "database-connections/collection-data",
+        {
+            "conid": "con2",
+            "database": "chinook",
+            "options": {
+                "pureName": "artists",
+                "limit": 10,
+                "skip": 5,
+                "condition": {
+                    "conditionType": "binary",
+                    "operator": "=",
+                    "left": {"exprType": "column", "columnName": "name"},
+                    "right": {"exprType": "value", "value": "AC/DC"},
+                },
+                "sort": [{"columnName": "name", "direction": "ASC"}],
+            },
+        },
+    )
+    assert out == {
+        "database": "chinook",
+        "collection": "artists",
+        "documents": [{"_id": 1, "name": "AC/DC"}],
+        "count": 1,
+        "truncated": False,
+    }
+
+
+def test_find_documents_omits_empty_filter_and_sort(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/collection-data": {"rows": []},
+        },
+    )
+
+    asyncio.run(_fn(server.find_documents)(conid="con2", collection="albums"))
+
+    options = calls[1][1]["options"]
+    assert options == {"pureName": "albums", "limit": 200, "skip": 0}
+
+
+def test_find_documents_truncates(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/collection-data": {"rows": [{"n": i} for i in range(4)]},
+        },
+    )
+
+    out = asyncio.run(
+        _fn(server.find_documents)(conid="con2", collection="albums", limit=2)
+    )
+
+    assert out["documents"] == [{"n": 0}, {"n": 1}]
+    assert out["count"] == 2
+    assert out["truncated"] is True
+
+
+def test_find_documents_reports_bad_filter(monkeypatch):
+    _stub(monkeypatch, {"connections/list": CONNECTIONS})
+
+    out = asyncio.run(
+        _fn(server.find_documents)(
+            conid="con2", collection="albums", filter={"a": {"$exists": True}}
+        )
+    )
+
+    assert out == {"error": "unsupported filter operator '$exists'"}
+
+
+def test_find_documents_reports_dbgate_error(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/collection-data": DbGateError("collection not found"),
+        },
+    )
+
+    out = asyncio.run(_fn(server.find_documents)(conid="con2", collection="ghost"))
+
+    assert out == {"error": "collection not found"}
+
+
 def test_split_endpoint_parses_host_and_port():
     assert server._split_endpoint("http://dbgate.internal:3000") == (
         "dbgate.internal",
