@@ -1,3 +1,10 @@
 /.mcp.json
 /.claude
 /init
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+dist/
