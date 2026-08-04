@@ -397,6 +397,93 @@ async def find_documents(
     }
 
 
+@mcp.tool()
+async def redis_keys(
+    conid: str,
+    root: str | None = None,
+    filter: str | None = None,
+    limit: int = DEFAULT_ROW_LIMIT,
+    database: str | None = None,
+) -> dict:
+    """Browse the Redis key space one level at a time.
+
+    Without ``root`` the reply lists key prefixes (``level: "prefixes"``);
+    with it, the actual keys under that prefix (``level: "keys"``). Pass a
+    prefix's ``name`` back as ``root`` to descend.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        nodes = await dbgate.call(
+            "database-connections/load-keys",
+            {
+                "conid": conid,
+                "database": db,
+                "root": root or "",
+                "filter": filter or "",
+                "limit": limit,
+            },
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    shown = nodes[:limit]
+    items = [
+        {
+            "name": n.get("text"),
+            "key": n.get("key"),
+            "type": n.get("type"),
+            "count": n.get("count"),
+        }
+        if n.get("key")
+        else {"name": n.get("root"), "count": n.get("count")}
+        for n in shown
+    ]
+    return {
+        "database": db,
+        "level": "keys" if root else "prefixes",
+        "items": items,
+        "truncated": len(nodes) > limit,
+    }
+
+
+@mcp.tool()
+async def redis_get(
+    conid: str,
+    key: str,
+    limit: int = DEFAULT_ROW_LIMIT,
+    database: str | None = None,
+) -> dict:
+    """Read one Redis key: its type, TTL and value.
+
+    Strings come back in ``value``; hashes, lists, sets and sorted sets in
+    ``items``, read in a single page of ``limit`` entries. ``truncated: true``
+    means DbGate left its cursor open — use redis_command for the full value.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        info = await dbgate.call(
+            "database-connections/load-key-info",
+            {"conid": conid, "database": db, "key": key},
+        )
+        out = {
+            "database": db,
+            "key": info.get("key", key),
+            "type": info.get("type"),
+            "ttl": info.get("ttl"),
+        }
+        if "value" in info:
+            out["value"] = info.get("value")
+            return out
+        page = await dbgate.call(
+            "database-connections/load-key-table-range",
+            {"conid": conid, "database": db, "key": key, "cursor": 0, "count": limit},
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    out["items"] = page.get("items") or []
+    out["truncated"] = bool(page.get("cursor"))
+    return out
+
+
 def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 

@@ -776,6 +776,166 @@ def test_find_documents_reports_dbgate_error(monkeypatch):
     assert out == {"error": "collection not found"}
 
 
+def test_redis_keys_lists_prefixes(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-keys": [
+                {"text": "album:*", "type": "none", "root": "album", "count": 694}
+            ],
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_keys)(conid="con2"))
+
+    # calls[0] is the connections/list lookup that resolves the default database
+    assert calls[1] == (
+        "database-connections/load-keys",
+        {"conid": "con2", "database": "chinook", "root": "", "filter": "", "limit": 200},
+    )
+    assert out["level"] == "prefixes"
+    assert out["items"] == [{"name": "album", "count": 694}]
+
+
+def test_redis_keys_lists_keys_under_root(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-keys": [
+                {"text": "1", "key": "artist:1", "type": "hash", "count": 1}
+            ],
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_keys)(conid="con2", root="artist"))
+
+    assert out["level"] == "keys"
+    assert out["items"] == [
+        {"name": "1", "key": "artist:1", "type": "hash", "count": 1}
+    ]
+
+
+def test_redis_keys_truncates(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-keys": [
+                {"text": str(i), "key": f"k:{i}", "type": "string", "count": 1}
+                for i in range(4)
+            ],
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_keys)(conid="con2", root="k", limit=2))
+
+    assert len(out["items"]) == 2
+    assert out["truncated"] is True
+
+
+def test_redis_keys_reports_error(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-keys": DbGateError("not a redis connection"),
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_keys)(conid="con2"))
+
+    assert out == {"error": "not a redis connection"}
+
+
+def test_redis_get_returns_string_value(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-key-info": {
+                "key": "chinook:seeded", "type": "string", "ttl": -1, "value": "1"
+            },
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_get)(conid="con2", key="chinook:seeded"))
+
+    # calls[0] is the connections/list lookup that resolves the default database
+    assert calls[1] == (
+        "database-connections/load-key-info",
+        {"conid": "con2", "database": "chinook", "key": "chinook:seeded"},
+    )
+    assert out == {
+        "database": "chinook",
+        "key": "chinook:seeded",
+        "type": "string",
+        "ttl": -1,
+        "value": "1",
+    }
+
+
+def test_redis_get_reads_hash_items(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-key-info": {
+                "key": "artist:1", "type": "hash", "ttl": -1, "count": 1
+            },
+            "database-connections/load-key-table-range": {
+                "cursor": 0,
+                "items": [{"key": "name", "value": "AC/DC", "ttl": -1}],
+            },
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_get)(conid="con2", key="artist:1", limit=50))
+
+    assert calls[2] == (
+        "database-connections/load-key-table-range",
+        {"conid": "con2", "database": "chinook", "key": "artist:1",
+         "cursor": 0, "count": 50},
+    )
+    assert out["items"] == [{"key": "name", "value": "AC/DC", "ttl": -1}]
+    assert out["truncated"] is False
+    assert "value" not in out
+
+
+def test_redis_get_marks_truncated_on_open_cursor(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-key-info": {
+                "key": "big", "type": "list", "ttl": -1
+            },
+            "database-connections/load-key-table-range": {
+                "cursor": 512, "items": [{"key": "0", "value": "x"}]
+            },
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_get)(conid="con2", key="big"))
+
+    assert out["truncated"] is True
+
+
+def test_redis_get_reports_error(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-key-info": DbGateError("key not found"),
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_get)(conid="con2", key="ghost"))
+
+    assert out == {"error": "key not found"}
+
+
 def test_split_endpoint_parses_host_and_port():
     assert server._split_endpoint("http://dbgate.internal:3000") == (
         "dbgate.internal",
