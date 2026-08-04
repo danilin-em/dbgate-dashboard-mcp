@@ -936,6 +936,54 @@ def test_redis_get_reports_error(monkeypatch):
     assert out == {"error": "key not found"}
 
 
+def test_redis_command_passes_command_and_args(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/call-method": {"name": "AC/DC"},
+        },
+    )
+
+    out = asyncio.run(
+        _fn(server.redis_command)(conid="con2", command="hgetall", args=["artist:1"])
+    )
+
+    # calls[0] is the connections/list lookup that resolves the default database
+    assert calls[1] == (
+        "database-connections/call-method",
+        {"conid": "con2", "database": "chinook", "method": "hgetall",
+         "args": ["artist:1"]},
+    )
+    assert out == {"database": "chinook", "result": {"name": "AC/DC"}}
+
+
+def test_redis_command_defaults_args_to_empty(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/call-method": 5274},
+    )
+
+    out = asyncio.run(_fn(server.redis_command)(conid="con2", command="dbsize"))
+
+    assert calls[1][1]["args"] == []
+    assert out["result"] == 5274
+
+
+def test_redis_command_reports_error(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/call-method": DbGateError("unknown command"),
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_command)(conid="con2", command="nope"))
+
+    assert out == {"error": "unknown command"}
+
+
 def test_split_endpoint_parses_host_and_port():
     assert server._split_endpoint("http://dbgate.internal:3000") == (
         "dbgate.internal",

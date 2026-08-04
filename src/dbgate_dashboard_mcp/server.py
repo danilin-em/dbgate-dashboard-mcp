@@ -484,6 +484,29 @@ async def redis_get(
     return out
 
 
+@mcp.tool()
+async def redis_command(
+    conid: str,
+    command: str,
+    args: list | None = None,
+    database: str | None = None,
+) -> dict:
+    """Run any Redis command and return its raw result.
+
+    Writes are allowed (``SET``, ``DEL``, …) — this is the Redis counterpart of
+    execute. Use redis_keys and redis_get to explore before writing.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        result = await dbgate.call(
+            "database-connections/call-method",
+            {"conid": conid, "database": db, "method": command, "args": args or []},
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    return {"database": db, "result": result}
+
+
 def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 
