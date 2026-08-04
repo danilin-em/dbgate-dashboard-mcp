@@ -1,0 +1,156 @@
+
+services:
+  dbgate:
+    image: dbgate/dbgate:latest
+    restart: always
+    ports:
+      - 3000:3000
+    volumes:
+      - dbgate-data:/root/.dbgate
+      - ./init/db.sqlite:/root/db.sqlite
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      redis-seed:
+        condition: service_completed_successfully
+    environment:
+      CONNECTIONS: con1,con2,con3,con4,con5
+
+      LABEL_con1: MySQL
+      SERVER_con1: mysql
+      USER_con1: root
+      PASSWORD_con1: root
+      PORT_con1: 3306
+      DATABASE_con1: Chinook
+      ENGINE_con1: mysql@dbgate-plugin-mysql
+
+      LABEL_con2: PostgreSQL
+      SERVER_con2: postgres
+      USER_con2: postgres
+      PASSWORD_con2: postgres
+      PORT_con2: 5432
+      DATABASE_con2: chinook
+      ENGINE_con2: postgres@dbgate-plugin-postgres
+
+      LABEL_con3: MongoDB
+      URL_con3: mongodb://mongo:27017
+      DATABASE_con3: chinook
+      ENGINE_con3: mongo@dbgate-plugin-mongo
+
+      LABEL_con4: SQLite
+      FILE_con4: /root/db.sqlite
+      ENGINE_con4: sqlite@dbgate-plugin-sqlite
+
+      LABEL_con5: Redis
+      URL_con5: redis://redis:6379
+      ENGINE_con5: redis@dbgate-plugin-redis
+
+  # con1
+  mysql:
+    image: mysql:8.4
+    restart: always
+    command: --mysql-native-password=ON
+    ports:
+      - 3306:3306
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # Chinook v1.4.5, официальный порт. Скрипт сам делает CREATE DATABASE `Chinook`.
+      - ./init/mysql:/docker-entrypoint-initdb.d:ro
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 40s
+
+  # con2
+  postgres:
+    image: postgres:17-alpine
+    restart: always
+    ports:
+      - 5432:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Chinook v1.4.5, официальный порт. Скрипт сам делает CREATE DATABASE chinook + \c chinook.
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chinook"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # con3
+  mongo:
+    image: mongo:8
+    restart: always
+    ports:
+      - 27017:27017
+    volumes:
+      - mongo-data:/data/db
+      # 01-chinook.sh импортирует data/*.json через mongoimport и строит индексы
+      - ./init/mongo:/docker-entrypoint-initdb.d:ro
+    environment:
+      MONGO_INITDB_DATABASE: chinook
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # con4 (SQLite) — файловая БД, .run/db.sqlite монтируется в dbgate, отдельный сервис не нужен
+
+  # con5
+  redis:
+    image: redis:8-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    ports:
+      - 6379:6379
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # У Redis нет docker-entrypoint-initdb.d — сидим отдельным одноразовым контейнером.
+  # Маркер chinook:seeded не даёт залить данные повторно поверх существующего тома.
+  redis-seed:
+    image: redis:8-alpine
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./init/redis:/seed:ro
+    command:
+      - sh
+      - -c
+      - |
+        if [ "$$(redis-cli -h redis EXISTS chinook:seeded)" = "1" ]; then
+          echo "chinook: redis already seeded, skipping"
+          exit 0
+        fi
+        redis-cli -h redis --pipe < /seed/chinook.resp
+        redis-cli -h redis SET chinook:seeded 1
+        echo "chinook: redis seeded, $$(redis-cli -h redis DBSIZE) keys"
+
+volumes:
+  dbgate-data: null
+  mysql-data: null
+  postgres-data: null
+  mongo-data: null
+  redis-data: null
