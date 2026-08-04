@@ -405,6 +405,114 @@ def test_describe_table_describes_a_view(monkeypatch):
     assert out["primary_key"] is None
 
 
+def test_apply_limit_appends_when_absent():
+    assert server._apply_limit("select * from artist", 10) == (
+        "select * from artist\nLIMIT 10"
+    )
+
+
+def test_apply_limit_strips_trailing_semicolon():
+    assert server._apply_limit("select 1;  ", 5) == "select 1\nLIMIT 5"
+
+
+def test_apply_limit_keeps_existing_limit():
+    assert server._apply_limit("select 1 LIMIT 3", 10) == "select 1 LIMIT 3"
+
+
+def test_apply_limit_keeps_fetch_first():
+    sql = "select 1 fetch first 3 rows only"
+    assert server._apply_limit(sql, 10) == sql
+
+
+def test_apply_limit_keeps_top():
+    sql = "select top 3 * from artist"
+    assert server._apply_limit(sql, 10) == sql
+
+
+def test_query_appends_limit_and_shapes_result(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": {
+                "msgtype": "response",
+                "rows": [{"artist_id": 1, "name": "AC/DC"}],
+                "columns": [{"columnName": "artist_id"}, {"columnName": "name"}],
+            },
+        },
+    )
+
+    out = asyncio.run(_fn(server.query)(conid="con2", sql="select * from artist"))
+
+    # calls[0] is the connections/list lookup that resolves the default database
+    assert calls[1] == (
+        "database-connections/query-data",
+        {
+            "conid": "con2",
+            "database": "chinook",
+            "sql": "select * from artist\nLIMIT 200",
+        },
+    )
+    assert out == {
+        "database": "chinook",
+        "columns": ["artist_id", "name"],
+        "rows": [{"artist_id": 1, "name": "AC/DC"}],
+        "row_count": 1,
+        "truncated": False,
+    }
+
+
+def test_query_truncates_rows_beyond_limit(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": {
+                "rows": [{"n": i} for i in range(5)],
+                "columns": [{"columnName": "n"}],
+            },
+        },
+    )
+
+    out = asyncio.run(
+        _fn(server.query)(conid="con2", sql="select n from t limit 5", limit=2)
+    )
+
+    assert out["rows"] == [{"n": 0}, {"n": 1}]
+    assert out["row_count"] == 2
+    assert out["truncated"] is True
+
+
+def test_query_handles_missing_rows_key(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": {"msgtype": "response"},
+        },
+    )
+
+    out = asyncio.run(_fn(server.query)(conid="con2", sql="select 1"))
+
+    assert out["rows"] == []
+    assert out["columns"] == []
+    assert out["truncated"] is False
+
+
+def test_query_reports_sql_error(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": DbGateError('relation "Artist" does not exist'),
+        },
+    )
+
+    out = asyncio.run(_fn(server.query)(conid="con2", sql='select * from "Artist"'))
+
+    assert out == {"error": 'relation "Artist" does not exist'}
+
+
 def test_split_endpoint_parses_host_and_port():
     assert server._split_endpoint("http://dbgate.internal:3000") == (
         "dbgate.internal",

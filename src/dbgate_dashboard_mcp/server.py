@@ -11,6 +11,7 @@ Every tool returns a dict and never raises: failures come back as
 from __future__ import annotations
 
 import os
+import re
 from urllib.parse import urlparse
 
 from mcp.server.mcpserver import MCPServer
@@ -258,6 +259,50 @@ async def describe_table(
         "foreign_keys": [_clean_foreign_key(fk) for fk in obj.get("foreignKeys") or []],
         "indexes": [_clean_index(ix) for ix in obj.get("indexes") or []],
         "uniques": [_clean_constraint(u) for u in obj.get("uniques") or []],
+    }
+
+
+_LIMIT_RE = re.compile(r"\b(limit|fetch\s+first|fetch\s+next|top)\b", re.IGNORECASE)
+
+
+def _apply_limit(sql: str, limit: int) -> str:
+    """Append ``LIMIT n`` unless the query already caps its result set."""
+    stripped = sql.strip().rstrip(";").rstrip()
+    if _LIMIT_RE.search(stripped):
+        return stripped
+    return f"{stripped}\nLIMIT {limit}"
+
+
+@mcp.tool()
+async def query(
+    conid: str,
+    sql: str,
+    database: str | None = None,
+    limit: int = DEFAULT_ROW_LIMIT,
+) -> dict:
+    """Run a read query and return at most ``limit`` rows.
+
+    ``LIMIT n`` is appended when the SQL has no cap of its own, and the result
+    is truncated to ``limit`` regardless — DbGate's query API takes no row
+    limit parameter, so the cap has to be enforced on both ends.
+
+    Use execute for statements that change data or schema.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        result = await dbgate.call(
+            "database-connections/query-data",
+            {"conid": conid, "database": db, "sql": _apply_limit(sql, limit)},
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    rows = result.get("rows") or []
+    return {
+        "database": db,
+        "columns": [c.get("columnName") for c in result.get("columns") or []],
+        "rows": rows[:limit],
+        "row_count": len(rows[:limit]),
+        "truncated": len(rows) > limit,
     }
 
 
