@@ -169,6 +169,98 @@ async def list_tables(
     return {"database": db, "objects": objects}
 
 
+def _column_names(columns: list[dict] | None, key: str = "columnName") -> list[str]:
+    return [c.get(key) for c in columns or []]
+
+
+def _clean_constraint(constraint: dict | None) -> dict | None:
+    if not constraint:
+        return None
+    return {
+        "name": constraint.get("constraintName"),
+        "columns": _column_names(constraint.get("columns")),
+    }
+
+
+def _clean_foreign_key(fk: dict) -> dict:
+    return {
+        "name": fk.get("constraintName"),
+        "columns": _column_names(fk.get("columns")),
+        "references": f"{fk.get('refSchemaName')}.{fk.get('refTableName')}"
+        if fk.get("refSchemaName")
+        else fk.get("refTableName"),
+        "ref_columns": _column_names(fk.get("columns"), "refColumnName"),
+        "on_update": fk.get("updateAction"),
+        "on_delete": fk.get("deleteAction"),
+    }
+
+
+def _clean_index(index: dict) -> dict:
+    return {
+        "name": index.get("constraintName"),
+        "unique": bool(index.get("isUnique")),
+        "columns": _column_names(index.get("columns")),
+    }
+
+
+def _find_object(structure: dict, table: str, schema: str | None) -> tuple[dict, str]:
+    """Locate one table/view/matview by (optionally qualified) name."""
+    if schema is None and "." in table:
+        schema, table = table.split(".", 1)
+    matches = [
+        (obj, kind)
+        for key, kind in _OBJECT_KINDS
+        for obj in structure.get(key) or []
+        if obj.get("pureName") == table
+        and (schema is None or obj.get("schemaName") == schema)
+    ]
+    if not matches:
+        raise _ResolveError(f"no table, view or matview named '{table}'")
+    if len(matches) > 1:
+        names = ", ".join(f"{o.get('schemaName')}.{o.get('pureName')}" for o, _ in matches)
+        raise _ResolveError(f"ambiguous table name '{table}' — pass schema: {names}")
+    return matches[0]
+
+
+@mcp.tool()
+async def describe_table(
+    conid: str,
+    table: str,
+    database: str | None = None,
+    schema: str | None = None,
+) -> dict:
+    """Describe one table, view or matview: columns, keys, indexes.
+
+    ``table`` may be qualified (``public.artist``) instead of passing ``schema``.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        structure = await _structure(conid, db)
+        obj, kind = _find_object(structure, table, schema)
+    except Exception as exc:
+        return {"error": str(exc)}
+    return {
+        "database": db,
+        "schema": obj.get("schemaName"),
+        "name": obj.get("pureName"),
+        "type": kind,
+        "columns": [
+            {
+                "name": c.get("columnName"),
+                "type": c.get("dataType"),
+                "not_null": c.get("notNull"),
+                "default": c.get("defaultValue"),
+                "auto_increment": c.get("autoIncrement"),
+            }
+            for c in obj.get("columns") or []
+        ],
+        "primary_key": _clean_constraint(obj.get("primaryKey")),
+        "foreign_keys": [_clean_foreign_key(fk) for fk in obj.get("foreignKeys") or []],
+        "indexes": [_clean_index(ix) for ix in obj.get("indexes") or []],
+        "uniques": [_clean_constraint(u) for u in obj.get("uniques") or []],
+    }
+
+
 def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 

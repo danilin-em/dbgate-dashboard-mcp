@@ -306,6 +306,105 @@ def test_list_tables_reports_error(monkeypatch):
     assert out == {"error": "database not found"}
 
 
+def test_describe_table_returns_columns_and_pk(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.describe_table)(conid="con2", table="artist"))
+
+    assert out["schema"] == "public"
+    assert out["name"] == "artist"
+    assert out["type"] == "table"
+    assert out["columns"][0] == {
+        "name": "artist_id",
+        "type": "integer",
+        "not_null": True,
+        "default": None,
+        "auto_increment": False,
+    }
+    assert out["primary_key"] == {
+        "name": "artist_pkey",
+        "columns": ["artist_id"],
+    }
+    assert out["foreign_keys"] == []
+
+
+def test_describe_table_returns_foreign_keys_and_indexes(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(
+        _fn(server.describe_table)(conid="con2", table="album", schema="public")
+    )
+
+    assert out["primary_key"] is None
+    assert out["foreign_keys"] == [
+        {
+            "name": "album_artist_id_fkey",
+            "columns": ["artist_id"],
+            "references": "public.artist",
+            "ref_columns": ["artist_id"],
+            "on_update": "NO ACTION",
+            "on_delete": "NO ACTION",
+        }
+    ]
+    assert out["indexes"] == [
+        {"name": "album_artist_id_idx", "unique": False, "columns": ["artist_id"]}
+    ]
+    assert out["uniques"] == []
+
+
+def test_describe_table_accepts_qualified_name(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.describe_table)(conid="con2", table="reporting.album"))
+
+    assert out["schema"] == "reporting"
+
+
+def test_describe_table_ambiguous_name_errors(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.describe_table)(conid="con2", table="album"))
+
+    assert "ambiguous" in out["error"]
+    assert "public.album" in out["error"]
+    assert "reporting.album" in out["error"]
+
+
+def test_describe_table_unknown_name_errors(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.describe_table)(conid="con2", table="ghost"))
+
+    assert "no table, view or matview named 'ghost'" in out["error"]
+
+
+def test_describe_table_describes_a_view(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.describe_table)(conid="con2", table="top_sellers"))
+
+    assert out["type"] == "view"
+    assert out["primary_key"] is None
+
+
 def test_split_endpoint_parses_host_and_port():
     assert server._split_endpoint("http://dbgate.internal:3000") == (
         "dbgate.internal",
