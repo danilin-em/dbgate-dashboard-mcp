@@ -74,16 +74,26 @@ async def _find_connection(conid: str) -> dict:
 
 
 async def _resolve_database(conid: str, database: str | None) -> str:
-    """Return ``database`` or the connection's default database."""
+    """Return ``database``, the connection's default, or its first database.
+
+    Redis connections carry no default database, so the list is consulted
+    before giving up — that resolves to ``db0`` without an engine-specific
+    branch.
+    """
     if database:
         return database
     conn = await _find_connection(conid)
     default = conn.get("defaultDatabase")
-    if not default:
-        raise _ResolveError(
-            f"connection '{conid}' has no default database — pass database explicitly"
-        )
-    return default
+    if default:
+        return default
+    rows = await dbgate.call("server-connections/list-databases", {"conid": conid})
+    for row in rows:
+        name = row.get("name")
+        if name:
+            return name
+    raise _ResolveError(
+        f"connection '{conid}' has no default database — pass database explicitly"
+    )
 
 
 @mcp.tool()
@@ -129,7 +139,12 @@ async def list_databases(conid: str) -> dict:
     return {"databases": [], "single_database": False}
 
 
-_OBJECT_KINDS = (("tables", "table"), ("views", "view"), ("matviews", "matview"))
+_OBJECT_KINDS = (
+    ("tables", "table"),
+    ("views", "view"),
+    ("matviews", "matview"),
+    ("collections", "collection"),
+)
 
 
 async def _structure(conid: str, database: str) -> dict:
@@ -240,7 +255,7 @@ async def describe_table(
         obj, kind = _find_object(structure, table, schema)
     except Exception as exc:
         return {"error": str(exc)}
-    return {
+    result = {
         "database": db,
         "schema": obj.get("schemaName"),
         "name": obj.get("pureName"),
@@ -260,6 +275,12 @@ async def describe_table(
         "indexes": [_clean_index(ix) for ix in obj.get("indexes") or []],
         "uniques": [_clean_constraint(u) for u in obj.get("uniques") or []],
     }
+    # Mongo collections carry no column list; report what they do have.
+    if obj.get("tableRowCount") is not None:
+        result["rows"] = obj.get("tableRowCount")
+    if obj.get("uniqueKey"):
+        result["unique_key"] = _column_names(obj.get("uniqueKey"))
+    return result
 
 
 _LIMIT_RE = re.compile(r"\b(limit|fetch\s+first|fetch\s+next|top)\b", re.IGNORECASE)

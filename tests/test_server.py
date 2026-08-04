@@ -111,6 +111,23 @@ STRUCTURE = {
 }
 
 
+MONGO_STRUCTURE = {
+    "engine": "mongo@dbgate-plugin-mongo",
+    "tables": [],
+    "collections": [
+        {
+            "pureName": "artists",
+            "tableRowCount": 275,
+            "sizeBytes": 12568,
+            "uniqueKey": [{"columnName": "_id"}],
+        },
+        {"pureName": "albums", "tableRowCount": 347, "sizeBytes": 21782},
+    ],
+    "views": [],
+    "matviews": [],
+}
+
+
 def _fn(tool):
     # Works whether @mcp.tool() returns the raw function or a Tool wrapper.
     return getattr(tool, "fn", tool)
@@ -176,11 +193,89 @@ def test_resolve_database_prefers_explicit_value(monkeypatch):
     assert calls == []  # explicit database needs no connection lookup
 
 
-def test_resolve_database_without_default_raises(monkeypatch):
-    _stub(monkeypatch, {"connections/list": CONNECTIONS})
+def test_resolve_database_falls_back_to_first_database(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": [{"name": "db0"}, {"name": "db1"}],
+        },
+    )
+
+    assert asyncio.run(server._resolve_database("con6", None)) == "db0"
+
+
+def test_resolve_database_skips_unnamed_databases(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": [{"sortOrder": 0}, {"name": "db1"}],
+        },
+    )
+
+    assert asyncio.run(server._resolve_database("con6", None)) == "db1"
+
+
+def test_resolve_database_without_default_or_list_raises(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": [],
+        },
+    )
 
     with pytest.raises(server._ResolveError, match="no default database"):
         asyncio.run(server._resolve_database("con6", None))
+
+
+def test_list_tables_includes_mongo_collections(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/structure": MONGO_STRUCTURE,
+        },
+    )
+
+    out = asyncio.run(_fn(server.list_tables)(conid="con2"))
+
+    assert out["objects"] == [
+        {"schema": None, "name": "artists", "type": "collection",
+         "columns": 0, "size_bytes": 12568},
+        {"schema": None, "name": "albums", "type": "collection",
+         "columns": 0, "size_bytes": 21782},
+    ]
+
+
+def test_describe_table_describes_a_collection(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/structure": MONGO_STRUCTURE,
+        },
+    )
+
+    out = asyncio.run(_fn(server.describe_table)(conid="con2", table="artists"))
+
+    assert out["type"] == "collection"
+    assert out["columns"] == []
+    assert out["rows"] == 275
+    assert out["unique_key"] == ["_id"]
+
+
+def test_describe_table_omits_collection_fields_for_sql(monkeypatch):
+    _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/structure": STRUCTURE},
+    )
+
+    out = asyncio.run(_fn(server.describe_table)(conid="con2", table="artist"))
+
+    assert "rows" not in out
+    assert "unique_key" not in out
 
 
 def test_find_connection_refetches_once_for_unknown_conid(monkeypatch):
