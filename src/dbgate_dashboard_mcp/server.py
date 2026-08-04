@@ -288,11 +288,16 @@ _LIMIT_RE = re.compile(r"\b(limit|fetch\s+first|fetch\s+next|top)\b", re.IGNOREC
 
 
 def _apply_limit(sql: str, limit: int) -> str:
-    """Append ``LIMIT n`` unless the query already caps its result set."""
+    """Append ``LIMIT n+1`` unless the query already caps its result set.
+
+    One row beyond the cap is requested on purpose: the extra row is what
+    makes ``truncated`` meaningful. Asking for exactly ``limit`` would always
+    come back full and never distinguish "that's all" from "there is more".
+    """
     stripped = sql.strip().rstrip(";").rstrip()
     if _LIMIT_RE.search(stripped):
         return stripped
-    return f"{stripped}\nLIMIT {limit}"
+    return f"{stripped}\nLIMIT {limit + 1}"
 
 
 @mcp.tool()
@@ -374,7 +379,8 @@ async def find_documents(
     """
     try:
         db = await _resolve_database(conid, database)
-        options: dict = {"pureName": collection, "limit": limit, "skip": skip}
+        # One document past the cap, so `truncated` can tell full from more.
+        options: dict = {"pureName": collection, "limit": limit + 1, "skip": skip}
         condition = to_condition(filter)
         if condition is not None:
             options["condition"] = condition
@@ -420,7 +426,8 @@ async def redis_keys(
                 "database": db,
                 "root": root or "",
                 "filter": filter or "",
-                "limit": limit,
+                # One node past the cap, so `truncated` can tell full from more.
+                "limit": limit + 1,
             },
         )
     except Exception as exc:

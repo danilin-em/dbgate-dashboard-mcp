@@ -502,12 +502,12 @@ def test_describe_table_describes_a_view(monkeypatch):
 
 def test_apply_limit_appends_when_absent():
     assert server._apply_limit("select * from artist", 10) == (
-        "select * from artist\nLIMIT 10"
+        "select * from artist\nLIMIT 11"
     )
 
 
 def test_apply_limit_strips_trailing_semicolon():
-    assert server._apply_limit("select 1;  ", 5) == "select 1\nLIMIT 5"
+    assert server._apply_limit("select 1;  ", 5) == "select 1\nLIMIT 6"
 
 
 def test_apply_limit_keeps_existing_limit():
@@ -545,7 +545,7 @@ def test_query_appends_limit_and_shapes_result(monkeypatch):
         {
             "conid": "con2",
             "database": "chinook",
-            "sql": "select * from artist\nLIMIT 200",
+            "sql": "select * from artist\nLIMIT 201",
         },
     )
     assert out == {
@@ -575,6 +575,26 @@ def test_query_truncates_rows_beyond_limit(monkeypatch):
 
     assert out["rows"] == [{"n": 0}, {"n": 1}]
     assert out["row_count"] == 2
+    assert out["truncated"] is True
+
+
+def test_query_detects_more_rows_from_the_extra_row(monkeypatch):
+    # The tool asks for limit+1 rows; getting them back is what proves there
+    # is more data, since the engine caps the result at exactly the limit.
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": {
+                "rows": [{"n": i} for i in range(3)],
+                "columns": [{"columnName": "n"}],
+            },
+        },
+    )
+
+    out = asyncio.run(_fn(server.query)(conid="con2", sql="select n from t", limit=2))
+
+    assert out["rows"] == [{"n": 0}, {"n": 1}]
     assert out["truncated"] is True
 
 
@@ -696,7 +716,7 @@ def test_find_documents_translates_filter_and_sort(monkeypatch):
             "database": "chinook",
             "options": {
                 "pureName": "artists",
-                "limit": 10,
+                "limit": 11,
                 "skip": 5,
                 "condition": {
                     "conditionType": "binary",
@@ -729,7 +749,7 @@ def test_find_documents_omits_empty_filter_and_sort(monkeypatch):
     asyncio.run(_fn(server.find_documents)(conid="con2", collection="albums"))
 
     options = calls[1][1]["options"]
-    assert options == {"pureName": "albums", "limit": 200, "skip": 0}
+    assert options == {"pureName": "albums", "limit": 201, "skip": 0}
 
 
 def test_find_documents_truncates(monkeypatch):
@@ -747,6 +767,24 @@ def test_find_documents_truncates(monkeypatch):
 
     assert out["documents"] == [{"n": 0}, {"n": 1}]
     assert out["count"] == 2
+    assert out["truncated"] is True
+
+
+def test_find_documents_asks_for_one_extra_document(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/collection-data": {"rows": [{"n": 0}, {"n": 1}]},
+        },
+    )
+
+    out = asyncio.run(
+        _fn(server.find_documents)(conid="con2", collection="albums", limit=1)
+    )
+
+    assert calls[1][1]["options"]["limit"] == 2
+    assert out["documents"] == [{"n": 0}]
     assert out["truncated"] is True
 
 
@@ -792,7 +830,7 @@ def test_redis_keys_lists_prefixes(monkeypatch):
     # calls[0] is the connections/list lookup that resolves the default database
     assert calls[1] == (
         "database-connections/load-keys",
-        {"conid": "con2", "database": "chinook", "root": "", "filter": "", "limit": 200},
+        {"conid": "con2", "database": "chinook", "root": "", "filter": "", "limit": 201},
     )
     assert out["level"] == "prefixes"
     assert out["items"] == [{"name": "album", "count": 694}]
@@ -832,6 +870,25 @@ def test_redis_keys_truncates(monkeypatch):
     out = asyncio.run(_fn(server.redis_keys)(conid="con2", root="k", limit=2))
 
     assert len(out["items"]) == 2
+    assert out["truncated"] is True
+
+
+def test_redis_keys_asks_for_one_extra_node(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-keys": [
+                {"text": "a", "root": "a", "count": 1},
+                {"text": "b", "root": "b", "count": 1},
+            ],
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_keys)(conid="con2", limit=1))
+
+    assert calls[1][1]["limit"] == 2
+    assert out["items"] == [{"name": "a", "count": 1}]
     assert out["truncated"] is True
 
 
