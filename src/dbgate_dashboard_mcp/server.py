@@ -306,6 +306,31 @@ async def query(
     }
 
 
+@mcp.tool()
+async def execute(conid: str, sql: str, database: str | None = None) -> dict:
+    """Run any SQL statement, including writes and DDL.
+
+    The SQL is passed to DbGate verbatim — no row limit is added. Use query for
+    reads; this tool exists so that data and schema changes are an explicit,
+    separately auditable action.
+    """
+    try:
+        db = await _resolve_database(conid, database)
+        result = await dbgate.call(
+            "database-connections/query-data",
+            {"conid": conid, "database": db, "sql": sql},
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    rows = result.get("rows") or []
+    return {
+        "database": db,
+        "columns": [c.get("columnName") for c in result.get("columns") or []],
+        "rows": rows,
+        "row_count": len(rows),
+    }
+
+
 def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 

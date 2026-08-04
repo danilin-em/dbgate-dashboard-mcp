@@ -1,3 +1,88 @@
 # dbgate-dashboard-mcp
 
-MCP server for querying databases through a running DbGate dashboard.
+MCP-сервер, который даёт агенту доступ к базам данных **через запущенный дашборд [DbGate](https://dbgate.org/)**. Драйверы БД не нужны: соединения, плагины движков и пул держит сам DbGate, а сервер общается с ним по HTTP.
+
+Движки v1: MySQL, PostgreSQL, SQLite.
+
+## Установка
+
+```jsonc
+// .mcp.json
+{
+  "mcpServers": {
+    "dbgate-dashboard": {
+      "command": "uvx",
+      "args": ["dbgate-dashboard-mcp@latest"],
+      "env": {
+        "DBGATE_URL": "http://localhost:3000"
+      }
+    }
+  }
+}
+```
+
+Удалённый дашборд через SSH-туннель — `DBGATE_URL` при этом означает адрес **на удалённой стороне**:
+
+```jsonc
+"env": {
+  "DBGATE_URL": "http://localhost:3000",
+  "SSH_PROXY_TO": "user@remote-host"
+}
+```
+
+## Переменные окружения
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `DBGATE_URL` | `http://localhost:3000` | адрес дашборда (при туннеле — удалённая сторона) |
+| `DBGATE_LOGIN` | — | логин, если в DbGate включена авторизация |
+| `DBGATE_PASSWORD` | — | пароль к нему |
+| `SSH_PROXY_TO` | — | `user@host` для SSH-туннеля (`ssh -N -L`) |
+| `SSH_PROXY_PORT` | авто | фиксированный локальный порт туннеля |
+
+## Инструменты
+
+| Инструмент | Что делает |
+|---|---|
+| `list_connections` | соединения дашборда: `conid`, движок, БД по умолчанию |
+| `list_databases` | базы на соединении |
+| `list_tables` | таблицы, представления и matviews (без колонок) |
+| `describe_table` | колонки, PK, FK, индексы одного объекта |
+| `query` | читающий запрос; дописывает `LIMIT` и режет результат |
+| `execute` | любой SQL, включая запись и DDL, без модификации |
+
+`conid` обязателен во всех инструментах — берётся из `list_connections`. `database` можно не передавать: подставляется БД по умолчанию у соединения.
+
+`query` ограничивает выдачу дважды: дописывает `LIMIT n`, если в SQL нет собственного ограничения, и в любом случае режет ответ до `n` строк (`truncated: true` при обрезке). У API DbGate нет параметра лимита, поэтому предел приходится держать с обеих сторон.
+
+`execute` пропускает SQL без изменений и без предохранителя — включая `INSERT`/`UPDATE`/`DELETE` и DDL. Ограничивайте права на стороне самого соединения в DbGate.
+
+## Разработка
+
+```bash
+uv sync                 # venv + рантайм + dev-группа
+uv run pytest           # весь набор; в addopts зашито --cov-fail-under=100
+uv run pytest tests/test_server.py --no-cov   # частичный прогон — только с --no-cov
+python -m dbgate_dashboard_mcp                # запуск по stdio
+```
+
+Тесты не требуют ни сети, ни запущенного DbGate: `httpx` и `subprocess` подменяются.
+
+## Ручная проверка на тестовом стенде
+
+В репозитории лежит `docker-compose.yml` с DbGate и пятью базами (Chinook в MySQL, PostgreSQL, SQLite, MongoDB, Redis). Сиды лежат в `init/` и в репозиторий не коммитятся.
+
+```bash
+docker compose up -d
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/login \
+  -H 'Content-Type: application/json' -d '{"amoid":"none"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+curl -s -X POST http://localhost:3000/connections/list \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}'
+```
+
+Дальше — подключить сервер в MCP-клиенте с `DBGATE_URL=http://localhost:3000` и вызвать `list_connections`.
+
+## Как устроен API DbGate
+
+Полезно знать при доработке: DbGate — это RPC поверх HTTP, а не REST. Методы контроллеров смонтированы как kebab-case пути (`queryData` → `/database-connections/query-data`), почти все — `POST` с одним JSON-объектом аргументов. Токен выдаёт `POST /auth/login {"amoid":"none"}`, живёт 24 ч. Ошибки SQL приходят с **HTTP 200** и полем `errorMessage`, поэтому успех определяется телом ответа, а не кодом.

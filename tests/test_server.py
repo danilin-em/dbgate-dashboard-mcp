@@ -513,6 +513,66 @@ def test_query_reports_sql_error(monkeypatch):
     assert out == {"error": 'relation "Artist" does not exist'}
 
 
+def test_execute_passes_sql_through_untouched(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": {"msgtype": "response", "rows": [], "columns": []},
+        },
+    )
+
+    out = asyncio.run(
+        _fn(server.execute)(conid="con2", sql="insert into artist(name) values ('X');")
+    )
+
+    # calls[0] is the connections/list lookup that resolves the default database
+    assert calls[1] == (
+        "database-connections/query-data",
+        {
+            "conid": "con2",
+            "database": "chinook",
+            "sql": "insert into artist(name) values ('X');",
+        },
+    )
+    assert out == {"database": "chinook", "columns": [], "rows": [], "row_count": 0}
+
+
+def test_execute_returns_rows_when_engine_produces_them(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": {
+                "rows": [{"id": 7}],
+                "columns": [{"columnName": "id"}],
+            },
+        },
+    )
+
+    out = asyncio.run(
+        _fn(server.execute)(conid="con2", sql="insert into t values (7) returning id")
+    )
+
+    assert out["rows"] == [{"id": 7}]
+    assert out["columns"] == ["id"]
+    assert out["row_count"] == 1
+
+
+def test_execute_reports_error(monkeypatch):
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/query-data": DbGateError("syntax error at or near"),
+        },
+    )
+
+    out = asyncio.run(_fn(server.execute)(conid="con2", sql="delte from t"))
+
+    assert out == {"error": "syntax error at or near"}
+
+
 def test_split_endpoint_parses_host_and_port():
     assert server._split_endpoint("http://dbgate.internal:3000") == (
         "dbgate.internal",
