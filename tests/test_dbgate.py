@@ -90,3 +90,92 @@ def test_base_url_from_env_strips_trailing_slash(monkeypatch):
 def test_base_url_defaults_to_localhost(monkeypatch):
     monkeypatch.delenv("DBGATE_URL", raising=False)
     assert dbgate.base_url() == "http://localhost:3000"
+
+
+def test_login_sends_credentials_when_env_set(http, monkeypatch):
+    monkeypatch.setenv("DBGATE_LOGIN", "admin")
+    monkeypatch.setenv("DBGATE_PASSWORD", "s3cret")
+    http.script += [_login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+
+    assert http.calls[0]["json"] == {
+        "amoid": "none",
+        "login": "admin",
+        "password": "s3cret",
+    }
+
+
+def test_login_password_defaults_to_empty(http, monkeypatch):
+    monkeypatch.setenv("DBGATE_LOGIN", "admin")
+    monkeypatch.delenv("DBGATE_PASSWORD", raising=False)
+    http.script += [_login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+
+    assert http.calls[0]["json"]["password"] == ""
+
+
+def test_login_http_error_raises(http):
+    http.script += [FakeResponse(status_code=500, payload={})]
+
+    with pytest.raises(dbgate.DbGateError, match="login failed: HTTP 500"):
+        asyncio.run(dbgate.call("connections/list"))
+
+
+def test_login_without_token_raises(http):
+    http.script += [FakeResponse(payload={"error": "nope"})]
+
+    with pytest.raises(dbgate.DbGateError, match="no accessToken"):
+        asyncio.run(dbgate.call("connections/list"))
+
+
+def test_sql_error_in_body_raises_despite_http_200(http):
+    http.script += [
+        _login_ok(),
+        FakeResponse(payload={"msgtype": "response", "errorMessage": "no such table"}),
+    ]
+
+    with pytest.raises(dbgate.DbGateError, match="no such table"):
+        asyncio.run(dbgate.call("database-connections/query-data", {"sql": "select 1"}))
+
+
+def test_api_error_in_body_raises(http):
+    http.script += [_login_ok(), FakeResponse(payload={"apiErrorMessage": "boom"})]
+
+    with pytest.raises(dbgate.DbGateError, match="boom"):
+        asyncio.run(dbgate.call("connections/list"))
+
+
+def test_expired_token_triggers_relogin_and_retry(http):
+    http.script += [
+        _login_ok("old"),
+        FakeResponse(status_code=401, payload=None),
+        _login_ok("fresh"),
+        FakeResponse(payload=[{"_id": "con1"}]),
+    ]
+
+    out = asyncio.run(dbgate.call("connections/list"))
+
+    assert out == [{"_id": "con1"}]
+    assert http.calls[-1]["headers"]["Authorization"] == "Bearer fresh"
+    assert len([c for c in http.calls if c["url"].endswith("/auth/login")]) == 2
+
+
+def test_second_401_raises(http):
+    http.script += [
+        _login_ok("old"),
+        FakeResponse(status_code=401, payload=None, text="missing authorization header"),
+        _login_ok("fresh"),
+        FakeResponse(status_code=401, payload=None, text="missing authorization header"),
+    ]
+
+    with pytest.raises(dbgate.DbGateError, match="HTTP 401"):
+        asyncio.run(dbgate.call("connections/list"))
+
+
+def test_non_200_raises_with_status_and_body(http):
+    http.script += [_login_ok(), FakeResponse(status_code=404, payload=None, text="Cannot POST")]
+
+    with pytest.raises(dbgate.DbGateError, match="HTTP 404"):
+        asyncio.run(dbgate.call("nope/whatever"))
