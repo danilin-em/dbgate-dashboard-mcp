@@ -10,6 +10,7 @@ Every tool returns a dict and never raises: failures come back as
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from urllib.parse import urlparse
@@ -41,6 +42,11 @@ SSH_PROXY_TO = os.environ.get("SSH_PROXY_TO") or None
 SSH_PROXY_PORT = _env_int("SSH_PROXY_PORT")
 
 DEFAULT_ROW_LIMIT = 200
+
+# A server connection DbGate has not opened yet answers "no databases" for a
+# moment before the real list appears, so an empty reply is retried.
+_COLD_RETRIES = 2
+_COLD_RETRY_DELAY = 0.3
 
 mcp = MCPServer("dbgate-dashboard-mcp")
 
@@ -74,6 +80,23 @@ async def _find_connection(conid: str) -> dict:
     raise _ResolveError(f"unknown conid '{conid}' — call list_connections first")
 
 
+async def _server_databases(conid: str) -> list[dict]:
+    """Database rows from DbGate, re-asked while the reply comes back empty.
+
+    An empty list means "the server connection is not open yet" as often as it
+    means "no databases" — Redis answers that way on the first touch and lists
+    db0..db15 a moment later, which is what made database resolution flaky.
+    """
+    rows: list[dict] = []
+    for attempt in range(_COLD_RETRIES + 1):
+        rows = await dbgate.call("server-connections/list-databases", {"conid": conid})
+        if rows:
+            break
+        if attempt < _COLD_RETRIES:
+            await asyncio.sleep(_COLD_RETRY_DELAY)
+    return rows
+
+
 async def _resolve_database(conid: str, database: str | None) -> str:
     """Return ``database``, the connection's default, or its first database.
 
@@ -87,7 +110,7 @@ async def _resolve_database(conid: str, database: str | None) -> str:
     default = conn.get("defaultDatabase")
     if default:
         return default
-    rows = await dbgate.call("server-connections/list-databases", {"conid": conid})
+    rows = await _server_databases(conid)
     for row in rows:
         name = row.get("name")
         if name:
@@ -128,7 +151,7 @@ async def list_databases(conid: str) -> dict:
     """
     try:
         conn = await _find_connection(conid)
-        rows = await dbgate.call("server-connections/list-databases", {"conid": conid})
+        rows = await _server_databases(conid)
     except Exception as exc:
         return {"error": str(exc)}
     names = [r.get("name") for r in rows if r.get("name")]
@@ -287,6 +310,29 @@ async def describe_table(
 _LIMIT_RE = re.compile(r"\b(limit|fetch\s+first|fetch\s+next|top)\b", re.IGNORECASE)
 
 
+# Statements that yield rows and accept a trailing LIMIT. An allowlist rather
+# than a blocklist of SHOW/PRAGMA/DESCRIBE/…: anything unrecognised then comes
+# back uncapped instead of coming back as a syntax error.
+_ROW_STATEMENTS = frozenset({"select", "with", "values", "table"})
+_FIRST_WORD_RE = re.compile(r"[\s(]*(\w+)")
+
+
+def _takes_limit(sql: str) -> bool:
+    """Whether a trailing ``LIMIT n`` is valid syntax for this statement.
+
+    ``SHOW TABLES LIKE 'x'``, ``PRAGMA table_info(t)``, ``DESCRIBE t`` and
+    ``EXPLAIN …`` are all rejected outright once a LIMIT is glued on, so only
+    the leading keyword decides — searching the whole statement would trip over
+    a CTE named ``show_data``.
+
+    Saying False is cheap: `query` slices ``rows[:limit]`` no matter what, so
+    the only cost is pulling a full result set over the wire.
+    """
+    # Leading parens so that `(select 1) union (select 2)` still gets capped.
+    head = _FIRST_WORD_RE.match(sql)
+    return head is not None and head.group(1).lower() in _ROW_STATEMENTS
+
+
 def _apply_limit(sql: str, limit: int) -> str:
     """Append ``LIMIT n+1`` unless the query already caps its result set.
 
@@ -295,7 +341,7 @@ def _apply_limit(sql: str, limit: int) -> str:
     come back full and never distinguish "that's all" from "there is more".
     """
     stripped = sql.strip().rstrip(";").rstrip()
-    if _LIMIT_RE.search(stripped):
+    if not _takes_limit(stripped) or _LIMIT_RE.search(stripped):
         return stripped
     return f"{stripped}\nLIMIT {limit + 1}"
 
@@ -309,9 +355,10 @@ async def query(
 ) -> dict:
     """Run a read query and return at most ``limit`` rows.
 
-    ``LIMIT n`` is appended when the SQL has no cap of its own, and the result
-    is truncated to ``limit`` regardless — DbGate's query API takes no row
-    limit parameter, so the cap has to be enforced on both ends.
+    ``LIMIT n`` is appended to row-returning statements that carry no cap of
+    their own, and the result is truncated to ``limit`` regardless — DbGate's
+    query API takes no row limit parameter, so the cap has to be enforced on
+    both ends. ``SHOW``, ``PRAGMA`` and friends are passed through untouched.
 
     Use execute for statements that change data or schema.
     """
@@ -462,8 +509,8 @@ async def redis_get(
     """Read one Redis key: its type, TTL and value.
 
     Strings come back in ``value``; hashes, lists, sets and sorted sets in
-    ``items``, read in a single page of ``limit`` entries. ``truncated: true``
-    means DbGate left its cursor open — use redis_command for the full value.
+    ``items``, capped at ``limit`` entries. ``truncated: true`` means the value
+    goes on past that — use redis_command to read the rest.
     """
     try:
         db = await _resolve_database(conid, database)
@@ -471,6 +518,10 @@ async def redis_get(
             "database-connections/load-key-info",
             {"conid": conid, "database": db, "key": key},
         )
+        # Redis reports an absent key as type "none"; reading it would only
+        # come back null.
+        if info.get("type") == "none":
+            return {"error": f"key '{key}' not found"}
         out = {
             "database": db,
             "key": info.get("key", key),
@@ -486,8 +537,11 @@ async def redis_get(
         )
     except Exception as exc:
         return {"error": str(exc)}
-    out["items"] = page.get("items") or []
-    out["truncated"] = bool(page.get("cursor"))
+    # `count` is a hint to Redis, not a cap, so the page can overshoot `limit`
+    # — and it is null when the key died between the two calls.
+    items = (page or {}).get("items") or []
+    out["items"] = items[:limit]
+    out["truncated"] = bool((page or {}).get("cursor")) or len(items) > limit
     return out
 
 
@@ -507,7 +561,14 @@ async def redis_command(
         db = await _resolve_database(conid, database)
         result = await dbgate.call(
             "database-connections/call-method",
-            {"conid": conid, "database": db, "method": command, "args": args or []},
+            {
+                "conid": conid,
+                "database": db,
+                # DbGate dispatches the name onto its Redis client, whose
+                # methods are lowercase — `PING` would fail as "not a function".
+                "method": command.strip().lower(),
+                "args": args or [],
+            },
         )
     except Exception as exc:
         return {"error": str(exc)}

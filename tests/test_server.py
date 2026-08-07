@@ -128,6 +128,12 @@ MONGO_STRUCTURE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _no_cold_retry_delay(monkeypatch):
+    """Keep the cold-connection retry backoff out of the test clock."""
+    monkeypatch.setattr(server, "_COLD_RETRY_DELAY", 0)
+
+
 def _fn(tool):
     # Works whether @mcp.tool() returns the raw function or a Tool wrapper.
     return getattr(tool, "fn", tool)
@@ -215,6 +221,51 @@ def test_resolve_database_skips_unnamed_databases(monkeypatch):
     )
 
     assert asyncio.run(server._resolve_database("con6", None)) == "db1"
+
+
+def test_resolve_database_retries_a_cold_empty_list(monkeypatch):
+    # DbGate answers with an empty list while it is still opening the server
+    # connection — the databases show up a moment later.
+    replies = [[], [{"name": "db0"}, {"name": "db1"}]]
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": lambda _: replies.pop(0),
+        },
+    )
+
+    assert asyncio.run(server._resolve_database("con6", None)) == "db0"
+    assert [path for path, _ in calls].count("server-connections/list-databases") == 2
+
+
+def test_resolve_database_gives_up_after_the_retries(monkeypatch):
+    calls = _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "server-connections/list-databases": []},
+    )
+
+    with pytest.raises(server._ResolveError, match="no default database"):
+        asyncio.run(server._resolve_database("con6", None))
+
+    assert [path for path, _ in calls].count("server-connections/list-databases") == (
+        server._COLD_RETRIES + 1
+    )
+
+
+def test_list_databases_retries_a_cold_empty_list(monkeypatch):
+    replies = [[], [{"name": "db0"}]]
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "server-connections/list-databases": lambda _: replies.pop(0),
+        },
+    )
+
+    out = asyncio.run(_fn(server.list_databases)(conid="con6"))
+
+    assert out == {"databases": ["db0"], "single_database": False}
 
 
 def test_resolve_database_without_default_or_list_raises(monkeypatch):
@@ -522,6 +573,31 @@ def test_apply_limit_keeps_fetch_first():
 def test_apply_limit_keeps_top():
     sql = "select top 3 * from artist"
     assert server._apply_limit(sql, 10) == sql
+
+
+def test_apply_limit_leaves_show_alone():
+    # MySQL: `SHOW TABLES LIKE 'x'\nLIMIT 201` is a syntax error.
+    sql = "SHOW TABLES LIKE 'mcp_smoke_test'"
+    assert server._apply_limit(sql, 200) == sql
+
+
+def test_apply_limit_leaves_pragma_alone():
+    sql = "PRAGMA table_info(Track)"
+    assert server._apply_limit(sql, 200) == sql
+
+
+def test_apply_limit_caps_a_parenthesised_union():
+    sql = "(select 1) union (select 2)"
+    assert server._apply_limit(sql, 10) == f"{sql}\nLIMIT 11"
+
+
+def test_apply_limit_leaves_an_empty_statement_alone():
+    assert server._apply_limit("   ", 10) == ""
+
+
+def test_apply_limit_caps_a_cte():
+    sql = "WITH recent AS (select 1) select * from recent"
+    assert server._apply_limit(sql, 10) == f"{sql}\nLIMIT 11"
 
 
 def test_query_appends_limit_and_shapes_result(monkeypatch):
@@ -993,6 +1069,74 @@ def test_redis_get_reports_error(monkeypatch):
     assert out == {"error": "key not found"}
 
 
+def test_redis_get_reports_a_missing_key(monkeypatch):
+    # A key that does not exist: Redis answers TYPE none / TTL -2, and asking
+    # for its contents afterwards comes back null.
+    calls = _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-key-info": {
+                "key": "ghost", "type": "none", "ttl": -2
+            },
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_get)(conid="con2", key="ghost"))
+
+    assert out == {"error": "key 'ghost' not found"}
+    # The value read is skipped entirely — there is nothing to page through.
+    assert [path for path, _ in calls] == [
+        "connections/list",
+        "database-connections/load-key-info",
+    ]
+
+
+def test_redis_get_survives_a_key_deleted_mid_read(monkeypatch):
+    # The key still existed at load-key-info and was gone by the value read,
+    # so DbGate answers null instead of a page.
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-key-info": {
+                "key": "vanishing", "type": "hash", "ttl": -1
+            },
+            "database-connections/load-key-table-range": None,
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_get)(conid="con2", key="vanishing"))
+
+    assert out["items"] == []
+    assert out["truncated"] is False
+
+
+def test_redis_get_truncates_items_beyond_limit(monkeypatch):
+    # Redis treats COUNT as a hint, so a page can come back longer than asked.
+    _stub(
+        monkeypatch,
+        {
+            "connections/list": CONNECTIONS,
+            "database-connections/load-key-info": {
+                "key": "wide", "type": "zset", "ttl": -1
+            },
+            "database-connections/load-key-table-range": {
+                "cursor": 0,
+                "items": [{"member": str(i), "score": str(i)} for i in range(5)],
+            },
+        },
+    )
+
+    out = asyncio.run(_fn(server.redis_get)(conid="con2", key="wide", limit=2))
+
+    assert out["items"] == [
+        {"member": "0", "score": "0"},
+        {"member": "1", "score": "1"},
+    ]
+    assert out["truncated"] is True
+
+
 def test_redis_command_passes_command_and_args(monkeypatch):
     calls = _stub(
         monkeypatch,
@@ -1025,6 +1169,21 @@ def test_redis_command_defaults_args_to_empty(monkeypatch):
 
     assert calls[1][1]["args"] == []
     assert out["result"] == 5274
+
+
+def test_redis_command_lowercases_the_command(monkeypatch):
+    # DbGate dispatches the name straight onto its Redis client, whose methods
+    # are all lowercase; `PING` would come back as "t.client[n] is not a
+    # function".
+    calls = _stub(
+        monkeypatch,
+        {"connections/list": CONNECTIONS, "database-connections/call-method": "PONG"},
+    )
+
+    out = asyncio.run(_fn(server.redis_command)(conid="con2", command="  PING "))
+
+    assert calls[1][1]["method"] == "ping"
+    assert out == {"database": "chinook", "result": "PONG"}
 
 
 def test_redis_command_reports_error(monkeypatch):
