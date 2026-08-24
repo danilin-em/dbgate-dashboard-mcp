@@ -256,3 +256,37 @@ def test_start_success_then_stop_terminates(monkeypatch):
     t.stop()
     assert fake.terminated is True
     assert t._proc is None
+
+
+def test_restart_registers_one_atexit_hook(monkeypatch):
+    """Reconnects call start() repeatedly — the atexit list must not grow."""
+    from dbgate_dashboard_mcp import tunnel as tunnel_mod
+
+    class ReadyProc:
+        def __init__(self):
+            self.stderr = io.StringIO("")
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    registered = []
+    monkeypatch.setattr(tunnel_mod.subprocess, "Popen", lambda *a, **k: ReadyProc())
+    monkeypatch.setattr(tunnel_mod, "_port_open", lambda port: True)
+    monkeypatch.setattr(tunnel_mod.atexit, "register", registered.append)
+
+    t = tunnel_mod.SshLocalForwardTunnel("user@remote", "localhost", 3000, local_port=6333)
+    t.start()
+    t.stop()
+    t.start()
+    t.stop()
+
+    assert len(registered) == 1

@@ -66,6 +66,7 @@ class SshLocalForwardTunnel:
         self.local_port = local_port if (local_port is not None and local_port > 0) else _pick_free_port()
         self._connect_timeout = connect_timeout
         self._proc: subprocess.Popen[str] | None = None
+        self._atexit_registered = False
 
     @property
     def local_url(self) -> str:
@@ -113,8 +114,12 @@ class SshLocalForwardTunnel:
             stderr=subprocess.PIPE,
             text=True,
         )
-        # Ensure the child never outlives us even on an unclean exit.
-        atexit.register(self.stop)
+        # Ensure the child never outlives us even on an unclean exit. Registered
+        # once per tunnel, not per start(): a reconnect restarts the same object,
+        # and `stop()` always acts on the current child anyway.
+        if not self._atexit_registered:
+            atexit.register(self.stop)
+            self._atexit_registered = True
 
         deadline = time.monotonic() + self._connect_timeout
         while time.monotonic() < deadline:

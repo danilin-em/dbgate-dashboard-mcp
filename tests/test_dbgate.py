@@ -3,9 +3,11 @@
 import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import dbgate_dashboard_mcp.dbgate as dbgate
+from dbgate_dashboard_mcp.transport import TunneledTransport
 
 
 class FakeResponse:
@@ -33,21 +35,28 @@ class FakeClient:
 
     async def post(self, url, json=None, headers=None):
         self._calls.append({"url": url, "json": json, "headers": headers})
-        return self._script.pop(0)
+        step = self._script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
 
 
 @pytest.fixture
 def http(monkeypatch):
     """Stub httpx.AsyncClient; `http.script` is the response queue."""
-    script, calls = [], []
-    monkeypatch.setattr(
-        dbgate.httpx, "AsyncClient", lambda *a, **k: FakeClient(script, calls)
-    )
+    script, calls, opts = [], [], []
+
+    def _fake_client(*a, **k):
+        opts.append(k)
+        return FakeClient(script, calls)
+
+    monkeypatch.setattr(dbgate.httpx, "AsyncClient", _fake_client)
     monkeypatch.delenv("DBGATE_LOGIN", raising=False)
     monkeypatch.delenv("DBGATE_PASSWORD", raising=False)
     monkeypatch.delenv("DBGATE_URL", raising=False)
     dbgate.reset_token()
-    return SimpleNamespace(script=script, calls=calls)
+    dbgate.reset_tunnel()
+    return SimpleNamespace(script=script, calls=calls, opts=opts)
 
 
 def _login_ok(token="tok1"):
@@ -179,3 +188,105 @@ def test_non_200_raises_with_status_and_body(http):
 
     with pytest.raises(dbgate.DbGateError, match="HTTP 404"):
         asyncio.run(dbgate.call("nope/whatever"))
+
+
+def test_no_transport_when_no_tunnel_is_configured(http):
+    http.script += [_login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+
+    assert http.opts[0]["transport"] is None
+
+
+def test_tunnel_routes_calls_through_a_tunneled_transport(http):
+    dbgate.use_tunnel("127.0.0.1", 15999)
+    http.script += [_login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+
+    sent = http.opts[0]["transport"]
+    assert isinstance(sent, TunneledTransport)
+    assert (sent._host, sent._port) == ("127.0.0.1", 15999)
+
+
+def test_tunnel_leaves_the_dashboard_url_canonical(http, monkeypatch):
+    """The transport moves, the URL does not — that is what keeps Host and SNI right."""
+    monkeypatch.setenv("DBGATE_URL", "https://dbgate.example.com")
+    dbgate.use_tunnel("127.0.0.1", 15999)
+    http.script += [_login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+
+    assert dbgate.base_url() == "https://dbgate.example.com"
+    assert http.calls[0]["url"] == "https://dbgate.example.com/auth/login"
+
+
+def _dropped():
+    """What httpx raises once the forwarded port stops accepting."""
+    return httpx.ConnectError("")
+
+
+def test_transport_error_without_a_tunnel_names_the_failure(http):
+    """The bare exception message is often empty — the class and URL are not."""
+    http.script += [_dropped()]
+
+    with pytest.raises(dbgate.DbGateError, match="ConnectError"):
+        asyncio.run(dbgate.call("connections/list"))
+
+
+def test_dropped_tunnel_is_reopened_and_the_call_retried(http):
+    dbgate.use_tunnel("127.0.0.1", 15999)
+    dbgate.on_tunnel_lost(lambda: ("127.0.0.1", 16001))
+    http.script += [_dropped(), _login_ok(), FakeResponse(payload=[{"_id": "con1"}])]
+
+    out = asyncio.run(dbgate.call("connections/list"))
+
+    assert out == [{"_id": "con1"}]
+    assert dbgate._tunnel == ("127.0.0.1", 16001)
+
+
+def test_reopening_tells_the_agent_what_happened(http):
+    dbgate.use_tunnel("127.0.0.1", 15999)
+    dbgate.on_tunnel_lost(lambda: ("127.0.0.1", 16001))
+    http.script += [_dropped(), _login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+
+    notices = dbgate.take_notices()
+    assert len(notices) == 1
+    assert "ConnectError" in notices[0]
+    assert "16001" in notices[0]
+
+
+def test_notices_drain_so_they_are_reported_once(http):
+    dbgate.use_tunnel("127.0.0.1", 15999)
+    dbgate.on_tunnel_lost(lambda: ("127.0.0.1", 16001))
+    http.script += [_dropped(), _login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+
+    assert dbgate.take_notices() != []
+    assert dbgate.take_notices() == []
+
+
+def test_a_second_drop_gives_up_instead_of_looping(http):
+    dbgate.use_tunnel("127.0.0.1", 15999)
+    dbgate.on_tunnel_lost(lambda: ("127.0.0.1", 16001))
+    http.script += [_dropped(), _dropped()]
+
+    with pytest.raises(dbgate.DbGateError, match="ConnectError"):
+        asyncio.run(dbgate.call("connections/list"))
+
+    assert http.script == []  # exactly two attempts, no third
+
+
+def test_relogin_happens_after_a_reopen(http):
+    """The old token is fine, but the fresh client must still authenticate."""
+    dbgate.use_tunnel("127.0.0.1", 15999)
+    dbgate.on_tunnel_lost(lambda: ("127.0.0.1", 16001))
+    http.script += [_login_ok(), _dropped(), _login_ok(), FakeResponse(payload=[])]
+
+    asyncio.run(dbgate.call("connections/list"))
+    asyncio.run(dbgate.call("connections/list"))
+
+    assert http.script == []

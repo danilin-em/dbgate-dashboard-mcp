@@ -11,6 +11,7 @@ Every tool returns a dict and never raises: failures come back as
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import re
 from urllib.parse import urlparse
@@ -30,14 +31,23 @@ def _env_int(name: str) -> int | None:
     return int(raw)
 
 
+# Port a portless URL implies. `urlparse` reports `port is None` rather than
+# guessing, so the scheme has to be mapped by hand — and a bare `http://` URL
+# means DbGate's own default of 3000, not HTTP's 80.
+_SCHEME_PORTS = {"https": 443}
+
+
 def _split_endpoint(url: str) -> tuple[str, int]:
     """Parse a dashboard URL into the ``(host, port)`` an ``ssh -L`` targets."""
     parsed = urlparse(url)
-    return parsed.hostname or "localhost", parsed.port or 3000
+    return parsed.hostname or "localhost", parsed.port or _SCHEME_PORTS.get(
+        parsed.scheme, 3000
+    )
 
 
 # When SSH_PROXY_TO is set, DBGATE_URL is the *remote-side* endpoint that gets
-# forwarded; main() rewrites DBGATE_URL to the local forwarded URL at startup.
+# forwarded. It is never rewritten: main() only tells the client which local
+# address to dial, so requests keep the dashboard's own Host and TLS name.
 SSH_PROXY_TO = os.environ.get("SSH_PROXY_TO") or None
 SSH_PROXY_PORT = _env_int("SSH_PROXY_PORT")
 
@@ -51,6 +61,28 @@ _COLD_RETRY_DELAY = 0.3
 mcp = MCPServer("dbgate-dashboard-mcp")
 
 _connections: list[dict] | None = None
+
+
+def _tool(fn):
+    """Register an MCP tool that also reports pending transport notices.
+
+    A tunnel reconnect is otherwise invisible: the retried call succeeds and
+    the result looks ordinary, so the caller would never learn the connection
+    was rebuilt underneath it. Draining the queue here covers every tool and
+    both the success and the ``{"error": ...}`` path.
+
+    ``functools.wraps`` matters — the MCP schema is derived from the wrapped
+    signature, and without it every tool would advertise ``(*args, **kwargs)``.
+    """
+
+    @mcp.tool()
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs) -> dict:
+        out = await fn(*args, **kwargs)
+        notices = dbgate.take_notices()
+        return {**out, "notices": notices} if notices else out
+
+    return wrapper
 
 
 class _ResolveError(Exception):
@@ -120,7 +152,7 @@ async def _resolve_database(conid: str, database: str | None) -> str:
     )
 
 
-@mcp.tool()
+@_tool
 async def list_connections() -> dict:
     """List the database connections configured in the DbGate dashboard."""
     try:
@@ -141,7 +173,7 @@ async def list_connections() -> dict:
     }
 
 
-@mcp.tool()
+@_tool
 async def list_databases(conid: str) -> dict:
     """List databases available on a connection.
 
@@ -178,7 +210,7 @@ async def _structure(conid: str, database: str) -> dict:
     )
 
 
-@mcp.tool()
+@_tool
 async def list_tables(
     conid: str, database: str | None = None, schema: str | None = None
 ) -> dict:
@@ -262,7 +294,7 @@ def _find_object(structure: dict, table: str, schema: str | None) -> tuple[dict,
     return matches[0]
 
 
-@mcp.tool()
+@_tool
 async def describe_table(
     conid: str,
     table: str,
@@ -346,7 +378,7 @@ def _apply_limit(sql: str, limit: int) -> str:
     return f"{stripped}\nLIMIT {limit + 1}"
 
 
-@mcp.tool()
+@_tool
 async def query(
     conid: str,
     sql: str,
@@ -380,7 +412,7 @@ async def query(
     }
 
 
-@mcp.tool()
+@_tool
 async def execute(conid: str, sql: str, database: str | None = None) -> dict:
     """Run any SQL statement, including writes and DDL.
 
@@ -405,7 +437,7 @@ async def execute(conid: str, sql: str, database: str | None = None) -> dict:
     }
 
 
-@mcp.tool()
+@_tool
 async def find_documents(
     conid: str,
     collection: str,
@@ -450,7 +482,7 @@ async def find_documents(
     }
 
 
-@mcp.tool()
+@_tool
 async def redis_keys(
     conid: str,
     root: str | None = None,
@@ -499,7 +531,7 @@ async def redis_keys(
     }
 
 
-@mcp.tool()
+@_tool
 async def redis_get(
     conid: str,
     key: str,
@@ -545,7 +577,7 @@ async def redis_get(
     return out
 
 
-@mcp.tool()
+@_tool
 async def redis_command(
     conid: str,
     command: str,
@@ -579,21 +611,38 @@ def main() -> None:
     """Console-script entry point: run the MCP server over stdio.
 
     When ``SSH_PROXY_TO`` is set, open an ``ssh -L`` tunnel to the dashboard
-    first and repoint ``DBGATE_URL`` at the forwarded local port; the client
-    reads that env var on every call, so tools need no changes. The tunnel
-    lives exactly as long as the server.
+    first and tell the client to dial the forwarded local port. ``DBGATE_URL``
+    is deliberately left alone: it is what gives every request its ``Host``
+    header and TLS name, and overwriting it with ``127.0.0.1`` breaks both. The
+    tunnel lives exactly as long as the server.
     """
     tunnel: SshLocalForwardTunnel | None = None
     if SSH_PROXY_TO:
         host, port = _split_endpoint(dbgate.base_url())
         tunnel = SshLocalForwardTunnel(SSH_PROXY_TO, host, port, SSH_PROXY_PORT)
         tunnel.start()
-        os.environ["DBGATE_URL"] = tunnel.local_url
+        # The forward is bound to loopback by `_build_cmd`.
+        dbgate.use_tunnel("127.0.0.1", tunnel.local_port)
+
+        def reopen() -> tuple[str, int]:
+            """Respawn ssh after it died and report where the forward landed.
+
+            ``stop()`` first because the child may be a zombie rather than
+            gone; it is idempotent, so it is also correct when ssh already
+            exited. The local port is fixed at construction and reused, so the
+            new forward comes back on the same address.
+            """
+            tunnel.stop()
+            tunnel.start()
+            return "127.0.0.1", tunnel.local_port
+
+        dbgate.on_tunnel_lost(reopen)
     try:
         mcp.run()
     finally:
         if tunnel is not None:
             tunnel.stop()
+            dbgate.reset_tunnel()
 
 
 if __name__ == "__main__":

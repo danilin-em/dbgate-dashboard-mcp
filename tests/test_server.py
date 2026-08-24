@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+import dbgate_dashboard_mcp.dbgate as dbgate
 import dbgate_dashboard_mcp.server as server
 from dbgate_dashboard_mcp.dbgate import DbGateError
 
@@ -1211,6 +1212,20 @@ def test_split_endpoint_defaults_port_to_3000():
     assert server._split_endpoint("http://127.0.0.1") == ("127.0.0.1", 3000)
 
 
+def test_split_endpoint_defaults_https_port_to_443():
+    assert server._split_endpoint("https://dbgate.example.com") == (
+        "dbgate.example.com",
+        443,
+    )
+
+
+def test_split_endpoint_keeps_explicit_https_port():
+    assert server._split_endpoint("https://dbgate.example.com:8443") == (
+        "dbgate.example.com",
+        8443,
+    )
+
+
 def test_env_int_blank_is_none(monkeypatch):
     monkeypatch.delenv("SSH_PROXY_PORT", raising=False)
     assert server._env_int("SSH_PROXY_PORT") is None
@@ -1230,35 +1245,139 @@ def test_main_runs_without_tunnel(monkeypatch):
     assert ran == ["run"]
 
 
-def test_main_opens_tunnel_and_repoints_url(monkeypatch):
-    events = []
+class FakeTunnel:
+    """Stands in for the ssh child; records the lifecycle into `events`."""
 
-    class FakeTunnel:
-        def __init__(self, target, host, port, local_port):
-            events.append(("init", target, host, port, local_port))
-            self.local_url = "http://127.0.0.1:15999"
+    events: list = []
 
-        def start(self):
-            events.append(("start",))
+    def __init__(self, target, host, port, local_port):
+        self.events.append(("init", target, host, port, local_port))
+        self.local_port = 15999
 
-        def stop(self):
-            events.append(("stop",))
+    def start(self):
+        self.events.append(("start",))
 
-    monkeypatch.setenv("DBGATE_URL", "http://dbgate.internal:3000")
+    def stop(self):
+        self.events.append(("stop",))
+
+
+def test_main_opens_tunnel_and_routes_the_client_through_it(monkeypatch):
+    events = FakeTunnel.events = []
+    monkeypatch.setenv("DBGATE_URL", "https://dbgate.example.com")
     monkeypatch.setattr(server, "SSH_PROXY_TO", "user@remote")
     monkeypatch.setattr(server, "SSH_PROXY_PORT", None)
     monkeypatch.setattr(server, "SshLocalForwardTunnel", FakeTunnel)
     monkeypatch.setattr(
         server.mcp,
         "run",
-        lambda: events.append(("url", server.os.environ["DBGATE_URL"])),
+        lambda: events.append(("serving", dbgate.base_url(), dbgate._tunnel)),
     )
+
+    try:
+        server.main()
+    finally:
+        dbgate.reset_tunnel()
+
+    assert events == [
+        ("init", "user@remote", "dbgate.example.com", 443, None),
+        ("start",),
+        # DBGATE_URL untouched; only the connect address moved.
+        ("serving", "https://dbgate.example.com", ("127.0.0.1", 15999)),
+        ("stop",),
+    ]
+
+
+def test_main_drops_the_tunnel_route_when_the_tunnel_stops(monkeypatch):
+    """A dead tunnel must not leave the client pointed at a closed port."""
+    FakeTunnel.events = []
+    monkeypatch.setenv("DBGATE_URL", "https://dbgate.example.com")
+    monkeypatch.setattr(server, "SSH_PROXY_TO", "user@remote")
+    monkeypatch.setattr(server, "SSH_PROXY_PORT", None)
+    monkeypatch.setattr(server, "SshLocalForwardTunnel", FakeTunnel)
+    monkeypatch.setattr(server.mcp, "run", lambda: None)
 
     server.main()
 
+    assert dbgate._tunnel is None
+
+
+@pytest.fixture
+def pending_notice():
+    """Queue one notice the way a real reconnect would, and clean up after."""
+    dbgate._notices.append("ssh tunnel dropped and was reopened on 127.0.0.1:16001")
+    yield
+    dbgate.reset_tunnel()
+
+
+def test_tool_result_reports_a_tunnel_reconnect(monkeypatch, pending_notice):
+    """A retried call looks identical to a normal one — say so explicitly."""
+    _stub(monkeypatch, {"connections/list": CONNECTIONS})
+
+    out = asyncio.run(_fn(server.list_connections)())
+
+    assert out["notices"] == ["ssh tunnel dropped and was reopened on 127.0.0.1:16001"]
+    assert len(out["connections"]) == len(CONNECTIONS)
+
+
+def test_tool_result_reports_a_reconnect_that_preceded_an_error(monkeypatch, pending_notice):
+    """Losing the notice on the error path would hide why the call failed."""
+    _stub(monkeypatch, {"connections/list": DbGateError("still unreachable")})
+
+    out = asyncio.run(_fn(server.list_connections)())
+
+    assert out["error"] == "still unreachable"
+    assert out["notices"] == ["ssh tunnel dropped and was reopened on 127.0.0.1:16001"]
+
+
+def test_tool_result_stays_clean_when_nothing_happened(monkeypatch):
+    _stub(monkeypatch, {"connections/list": CONNECTIONS})
+
+    out = asyncio.run(_fn(server.list_connections)())
+
+    assert "notices" not in out
+
+
+def test_tools_keep_their_schema_through_the_notice_wrapper():
+    """The wrapper must not flatten signatures into (*args, **kwargs)."""
+    tools = asyncio.run(server.mcp.list_tools())
+    by_name = {t.name: t for t in tools}
+
+    query = by_name["query"].input_schema
+    assert "conid" in query["properties"]
+    assert query["required"] == ["conid", "sql"]
+    assert by_name["list_connections"].description.startswith("List the database")
+
+
+def test_main_can_reopen_the_tunnel_after_a_drop(monkeypatch):
+    """The rebuild must tear the dead ssh child down before spawning a new one."""
+    events = FakeTunnel.events = []
+    monkeypatch.setenv("DBGATE_URL", "https://dbgate.example.com")
+    monkeypatch.setattr(server, "SSH_PROXY_TO", "user@remote")
+    monkeypatch.setattr(server, "SSH_PROXY_PORT", None)
+    monkeypatch.setattr(server, "SshLocalForwardTunnel", FakeTunnel)
+    monkeypatch.setattr(
+        server.mcp, "run", lambda: events.append(("reopened", dbgate._rebuild()))
+    )
+
+    try:
+        server.main()
+    finally:
+        dbgate.reset_tunnel()
+
     assert events == [
-        ("init", "user@remote", "dbgate.internal", 3000, None),
+        ("init", "user@remote", "dbgate.example.com", 443, None),
         ("start",),
-        ("url", "http://127.0.0.1:15999"),
+        ("stop",),
+        ("start",),
+        ("reopened", ("127.0.0.1", 15999)),
         ("stop",),
     ]
+
+
+def test_main_registers_no_rebuild_without_a_tunnel(monkeypatch):
+    monkeypatch.setattr(server, "SSH_PROXY_TO", None)
+    monkeypatch.setattr(server.mcp, "run", lambda: None)
+
+    server.main()
+
+    assert dbgate._rebuild is None
