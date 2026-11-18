@@ -116,7 +116,7 @@ python -m dbgate_dashboard_mcp                # запуск по stdio
 
 ## Ручная проверка на тестовом стенде
 
-В репозитории лежит `docker-compose.yml` с DbGate и пятью базами (Chinook в MySQL, PostgreSQL, SQLite, MongoDB, Redis). Сиды лежат в `init/` и в репозиторий не коммитятся.
+В репозитории лежит `docker-compose.yml` с DbGate и пятью базами (Chinook в MySQL, PostgreSQL, SQLite, MongoDB, Redis). Сиды лежат в `init/`: [Chinook](https://github.com/lerocha/chinook-database) (MIT, © Luis Rocha), переложенный под каждую СУБД.
 
 ```bash
 docker compose up -d
