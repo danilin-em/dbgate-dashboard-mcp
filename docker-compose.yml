@@ -58,7 +58,7 @@ services:
       - 3306:3306
     volumes:
       - mysql-data:/var/lib/mysql
-      # Chinook v1.4.5, официальный порт. Скрипт сам делает CREATE DATABASE `Chinook`.
+      # Chinook v1.4.5, official port. The script runs CREATE DATABASE `Chinook` itself.
       - ./init/mysql:/docker-entrypoint-initdb.d:ro
     environment:
       MYSQL_ROOT_PASSWORD: root
@@ -77,7 +77,7 @@ services:
       - 5432:5432
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # Chinook v1.4.5, официальный порт. Скрипт сам делает CREATE DATABASE chinook + \c chinook.
+      # Chinook v1.4.5, official port. The script runs CREATE DATABASE chinook + \c chinook itself.
       - ./init/postgres:/docker-entrypoint-initdb.d:ro
     environment:
       POSTGRES_USER: postgres
@@ -97,7 +97,7 @@ services:
       - 27017:27017
     volumes:
       - mongo-data:/data/db
-      # 01-chinook.sh импортирует data/*.json через mongoimport и строит индексы
+      # 01-chinook.sh imports data/*.json via mongoimport and builds indexes
       - ./init/mongo:/docker-entrypoint-initdb.d:ro
     environment:
       MONGO_INITDB_DATABASE: chinook
@@ -108,7 +108,7 @@ services:
       retries: 30
       start_period: 20s
 
-  # con4 (SQLite) — файловая БД, .run/db.sqlite монтируется в dbgate, отдельный сервис не нужен
+  # con4 (SQLite) is a file database: init/db.sqlite is mounted into dbgate, no separate service needed
 
   # con5
   redis:
@@ -126,8 +126,8 @@ services:
       retries: 20
       start_period: 5s
 
-  # У Redis нет docker-entrypoint-initdb.d — сидим отдельным одноразовым контейнером.
-  # Маркер chinook:seeded не даёт залить данные повторно поверх существующего тома.
+  # Redis has no docker-entrypoint-initdb.d, so a separate one-shot container seeds it.
+  # The chinook:seeded marker prevents re-seeding on top of an existing volume.
   redis-seed:
     image: redis:8-alpine
     restart: "no"

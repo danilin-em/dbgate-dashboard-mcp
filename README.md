@@ -1,10 +1,10 @@
 # dbgate-dashboard-mcp
 
-MCP-сервер, который даёт агенту доступ к базам данных **через запущенный дашборд [DbGate](https://dbgate.org/)**. Драйверы БД не нужны: соединения, плагины движков и пул держит сам DbGate, а сервер общается с ним по HTTP.
+An MCP server that gives an agent access to databases **through a running [DbGate](https://dbgate.org/) dashboard**. No database drivers are needed: DbGate itself holds the connections, engine plugins and pool, and the server talks to it over HTTP.
 
-Движки: MySQL, PostgreSQL, SQLite (SQL-инструменты), MongoDB и Redis (отдельные инструменты ниже).
+Engines: MySQL, PostgreSQL, SQLite (SQL tools), MongoDB and Redis (dedicated tools below).
 
-## Установка
+## Installation
 
 ```jsonc
 // .mcp.json
@@ -21,7 +21,7 @@ MCP-сервер, который даёт агенту доступ к база�
 }
 ```
 
-Удалённый дашборд через SSH-туннель — `DBGATE_URL` при этом означает адрес **на удалённой стороне**:
+A remote dashboard through an SSH tunnel — `DBGATE_URL` then means the address **on the remote side**:
 
 ```jsonc
 "env": {
@@ -30,7 +30,7 @@ MCP-сервер, который даёт агенту доступ к база�
 }
 ```
 
-HTTPS-дашборд за реверс-прокси работает так же — порт берётся из схемы (443), а `Host` и SNI остаются каноническими, так что проверка сертификата не отключается:
+An HTTPS dashboard behind a reverse proxy works the same way — the port comes from the scheme (443), while `Host` and SNI stay canonical, so certificate verification is not disabled:
 
 ```jsonc
 "env": {
@@ -39,13 +39,13 @@ HTTPS-дашборд за реверс-прокси работает так же
 }
 ```
 
-Туннель меняет только адрес подключения: `DBGATE_URL` не переписывается, иначе прокси получил бы `Host: 127.0.0.1:<порт>` и ушёл в редирект, а TLS не сошёлся бы с сертификатом.
+The tunnel only changes the connect address: `DBGATE_URL` is not rewritten, otherwise the proxy would receive `Host: 127.0.0.1:<port>` and answer with a redirect, and TLS would not match the certificate.
 
-### Обрыв туннеля
+### Tunnel loss
 
-Если ssh умирает посреди сессии, следующий вызов не падает: туннель поднимается заново и запрос повторяется **один раз**. Второй обрыв подряд уже возвращается ошибкой, чтобы недоступный удалённый хост не уводил каждый инструмент в бесконечные попытки.
+If ssh dies mid-session, the next call does not fail: the tunnel is reopened and the request is retried **once**. A second drop in a row is returned as an error, so an unreachable remote host does not send every tool into endless retries.
 
-Переподключение само по себе невидимо — повторённый вызов выглядит как обычный, — поэтому результат инструмента дополняется полем `notices`:
+A reconnect is invisible by itself — a retried call looks like an ordinary one — so the tool result gets a `notices` field:
 
 ```jsonc
 {
@@ -56,67 +56,67 @@ HTTPS-дашборд за реверс-прокси работает так же
 }
 ```
 
-Поле появляется только когда есть что сообщить, и ровно один раз: очередь опустошается при выдаче.
+The field appears only when there is something to report, and exactly once: the queue is drained when delivered.
 
-## Переменные окружения
+## Environment variables
 
-| Переменная | По умолчанию | Назначение |
+| Variable | Default | Purpose |
 |---|---|---|
-| `DBGATE_URL` | `http://localhost:3000` | адрес дашборда (при туннеле — удалённая сторона) |
-| `DBGATE_LOGIN` | — | логин, если в DbGate включена авторизация |
-| `DBGATE_PASSWORD` | — | пароль к нему |
-| `SSH_PROXY_TO` | — | `user@host` для SSH-туннеля (`ssh -N -L`) |
-| `SSH_PROXY_PORT` | авто | фиксированный локальный порт туннеля |
+| `DBGATE_URL` | `http://localhost:3000` | dashboard address (with a tunnel — the remote side) |
+| `DBGATE_LOGIN` | — | login, if authentication is enabled in DbGate |
+| `DBGATE_PASSWORD` | — | its password |
+| `SSH_PROXY_TO` | — | `user@host` for the SSH tunnel (`ssh -N -L`) |
+| `SSH_PROXY_PORT` | auto | fixed local port for the tunnel |
 
-## Инструменты
+## Tools
 
-| Инструмент | Что делает |
+| Tool | What it does |
 |---|---|
-| `list_connections` | соединения дашборда: `conid`, движок, БД по умолчанию |
-| `list_databases` | базы на соединении |
-| `list_tables` | таблицы, представления и matviews (без колонок) |
-| `describe_table` | колонки, PK, FK, индексы одного объекта |
-| `query` | читающий запрос; дописывает `LIMIT` и режет результат |
-| `execute` | любой SQL, включая запись и DDL, без модификации |
-| `find_documents` | документы Mongo-коллекции с фильтром и сортировкой |
-| `redis_keys` | обзор пространства ключей Redis по уровням |
-| `redis_get` | тип, TTL и значение одного ключа |
-| `redis_command` | любая команда Redis, включая запись |
+| `list_connections` | dashboard connections: `conid`, engine, default database |
+| `list_databases` | databases on a connection |
+| `list_tables` | tables, views and matviews (no columns) |
+| `describe_table` | columns, PK, FKs and indexes of one object |
+| `query` | a read query; appends `LIMIT` and truncates the result |
+| `execute` | any SQL, including writes and DDL, unmodified |
+| `find_documents` | documents of a Mongo collection with filter and sort |
+| `redis_keys` | browse the Redis keyspace level by level |
+| `redis_get` | type, TTL and value of one key |
+| `redis_command` | any Redis command, including writes |
 
-`conid` обязателен во всех инструментах — берётся из `list_connections`. `database` можно не передавать: подставляется БД по умолчанию у соединения.
+`conid` is required by every tool — take it from `list_connections`. `database` can be omitted: the connection's default database is used.
 
-`query` ограничивает выдачу дважды: дописывает `LIMIT n`, если в SQL нет собственного ограничения, и в любом случае режет ответ до `n` строк (`truncated: true` при обрезке). У API DbGate нет параметра лимита, поэтому предел приходится держать с обеих сторон.
+`query` limits the output twice: it appends `LIMIT n` if the SQL has no limit of its own, and in any case cuts the response to `n` rows (`truncated: true` when cut). The DbGate API has no limit parameter, so the bound has to be held on both sides.
 
-`LIMIT` дописывается только к тем командам, что его принимают (`SELECT`, `WITH`, `VALUES`, `TABLE`). `SHOW`, `PRAGMA`, `DESCRIBE`, `EXPLAIN` уходят в движок как есть — с приклеенным `LIMIT` они были бы синтаксической ошибкой; обрезка до `n` строк для них всё равно работает.
+`LIMIT` is appended only to statements that accept it (`SELECT`, `WITH`, `VALUES`, `TABLE`). `SHOW`, `PRAGMA`, `DESCRIBE`, `EXPLAIN` go to the engine as is — with a `LIMIT` glued on they would be a syntax error; cutting to `n` rows still applies to them.
 
-`execute` пропускает SQL без изменений и без предохранителя — включая `INSERT`/`UPDATE`/`DELETE` и DDL. Ограничивайте права на стороне самого соединения в DbGate.
+`execute` passes SQL through unchanged and without a safety net — including `INSERT`/`UPDATE`/`DELETE` and DDL. Restrict permissions on the connection itself in DbGate.
 
-## MongoDB и Redis
+## MongoDB and Redis
 
-`find_documents` принимает обычный Mongo-фильтр — `{"artistId": {"$gt": 5}}`, `{"title": {"$regex": "Rock"}}`, `$in`, `$and`/`$or`. Он транслируется в условие DbGate, потому что API дашборда сырой Mongo-фильтр не принимает. Неподдержанный оператор (`$exists`, `$elemMatch`) возвращает явную ошибку. `$regex` превращается в LIKE с обрамлением `%…%`, поэтому `%` и `_` внутри шаблона работают как подстановочные знаки.
+`find_documents` takes a regular Mongo filter — `{"artistId": {"$gt": 5}}`, `{"title": {"$regex": "Rock"}}`, `$in`, `$and`/`$or`. It is translated into a DbGate condition, because the dashboard API does not accept a raw Mongo filter. An unsupported operator (`$exists`, `$elemMatch`) returns an explicit error. `$regex` becomes a LIKE wrapped in `%…%`, so `%` and `_` inside the pattern act as wildcards.
 
-Коллекции видны через общий `list_tables` с `type: "collection"`; `describe_table` для коллекции отдаёт число документов и уникальный ключ — колонок в структуре Mongo у DbGate нет.
+Collections show up in the common `list_tables` with `type: "collection"`; `describe_table` for a collection returns the document count and the unique key — DbGate's Mongo structure has no columns.
 
-Для Redis навигация двухуровневая: `redis_keys` без `root` показывает префиксы (`album`, `track`, …), с `root` — ключи под ним. `redis_get` читает значение одной страницей не длиннее `limit` (`truncated: true`, если значение продолжается); за полными данными большого ключа — `redis_command`, который выполняет произвольную команду. Несуществующий ключ `redis_get` возвращает ошибкой `key '…' not found`.
+Redis navigation has two levels: `redis_keys` without `root` shows prefixes (`album`, `track`, …), with `root` — the keys under it. `redis_get` reads a value as one page no longer than `limit` (`truncated: true` if the value continues); for the full data of a large key use `redis_command`, which runs an arbitrary command. For a missing key `redis_get` returns the error `key '…' not found`.
 
-Имя команды в `redis_command` регистр не важен — оно приводится к нижнему, потому что DbGate вызывает метод одноимённо на своём Redis-клиенте, а там все методы строчные.
+The command name in `redis_command` is case-insensitive — it is lowercased, because DbGate calls the method of the same name on its Redis client, and all those methods are lowercase.
 
-У Redis-соединения нет базы по умолчанию, поэтому `database` можно не передавать: сервер берёт первую из списка (`db0`). Свежеоткрытое соединение DbGate отдаёт пустой список баз, пока поднимается, поэтому пустой ответ переспрашивается — без этого резолв базы иногда падал с `has no default database`.
+A Redis connection has no default database, so `database` can be omitted: the server takes the first one in the list (`db0`). A freshly opened DbGate connection returns an empty database list while it starts up, so an empty answer is asked again — without that, database resolution sometimes failed with `has no default database`.
 
-## Разработка
+## Development
 
 ```bash
-uv sync                 # venv + рантайм + dev-группа
-uv run pytest           # весь набор; в addopts зашито --cov-fail-under=100
-uv run pytest tests/test_server.py --no-cov   # частичный прогон — только с --no-cov
-python -m dbgate_dashboard_mcp                # запуск по stdio
+uv sync                 # venv + runtime + dev group
+uv run pytest           # full suite; addopts enforces --cov-fail-under=100
+uv run pytest tests/test_server.py --no-cov   # partial run — only with --no-cov
+python -m dbgate_dashboard_mcp                # run over stdio
 ```
 
-Тесты не требуют ни сети, ни запущенного DbGate: `httpx` и `subprocess` подменяются.
+Tests need neither network nor a running DbGate: `httpx` and `subprocess` are faked.
 
-## Ручная проверка на тестовом стенде
+## Manual check on the test stand
 
-В репозитории лежит `docker-compose.yml` с DbGate и пятью базами (Chinook в MySQL, PostgreSQL, SQLite, MongoDB, Redis). Сиды лежат в `init/`: [Chinook](https://github.com/lerocha/chinook-database) (MIT, © Luis Rocha), переложенный под каждую СУБД.
+The repository ships a `docker-compose.yml` with DbGate and five databases (Chinook in MySQL, PostgreSQL, SQLite, MongoDB, Redis). Seeds live in `init/`: [Chinook](https://github.com/lerocha/chinook-database) (MIT, © Luis Rocha), adapted for each engine.
 
 ```bash
 docker compose up -d
@@ -127,8 +127,8 @@ curl -s -X POST http://localhost:3000/connections/list \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}'
 ```
 
-Дальше — подключить сервер в MCP-клиенте с `DBGATE_URL=http://localhost:3000` и вызвать `list_connections`.
+Then connect the server in an MCP client with `DBGATE_URL=http://localhost:3000` and call `list_connections`.
 
-## Как устроен API DbGate
+## How the DbGate API works
 
-Полезно знать при доработке: DbGate — это RPC поверх HTTP, а не REST. Методы контроллеров смонтированы как kebab-case пути (`queryData` → `/database-connections/query-data`), почти все — `POST` с одним JSON-объектом аргументов. Токен выдаёт `POST /auth/login {"amoid":"none"}`, живёт 24 ч. Ошибки SQL приходят с **HTTP 200** и полем `errorMessage`, поэтому успех определяется телом ответа, а не кодом.
+Useful when extending the server: DbGate is RPC over HTTP, not REST. Controller methods are mounted as kebab-case paths (`queryData` → `/database-connections/query-data`), almost all of them `POST` with a single JSON object of arguments. `POST /auth/login {"amoid":"none"}` issues a token that lives 24 h. SQL errors arrive with **HTTP 200** and an `errorMessage` field, so success is decided by the response body, not the status code.

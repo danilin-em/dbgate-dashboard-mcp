@@ -1,10 +1,10 @@
 #!/bin/bash
-# Загружает Chinook в MongoDB. Выполняется entrypoint'ом только при пустом /data/db.
+# Loads Chinook into MongoDB. The entrypoint runs it only when /data/db is empty.
 #
-# ВАЖНО: mongo-entrypoint не запускает этот файл, а сорсит его (`. "$f"`).
-# Поэтому: (1) $0 указывает на сам entrypoint, путь к данным только абсолютный;
-# (2) тело обёрнуто в подоболочку, чтобы `set -e` и переменные не утекли в entrypoint;
-# (3) никаких `exit` — они убили бы entrypoint целиком.
+# IMPORTANT: the mongo entrypoint does not execute this file, it sources it (`. "$f"`).
+# Hence: (1) $0 points to the entrypoint itself, so the data path must be absolute;
+# (2) the body is wrapped in a subshell so `set -e` and variables do not leak into the entrypoint;
+# (3) no `exit` — it would kill the whole entrypoint.
 (
   set -euo pipefail
 
